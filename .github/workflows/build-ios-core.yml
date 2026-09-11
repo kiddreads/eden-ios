@@ -171,6 +171,13 @@ jobs:
             fi
           done
           cat result.md
+          # The whole point of this job is to answer "does the core cross-compile".
+          # Recording a failure in a table while the job goes green makes the gate
+          # decorative, so fail the job when any target failed.
+          if grep -q "| FAILED |" result.md; then
+            echo "::error::one or more core targets failed to cross-compile for iOS"
+            exit 1
+          fi
 
       - name: Summary
         if: always()
