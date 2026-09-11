@@ -144,7 +144,10 @@ jobs:
       - name: Build core libraries
         if: steps.configure.outcome == 'success'
         run: |
-          set -u
+          # pipefail matters here: the build is piped into tee, and without it the
+          # pipeline's status is tee's, which is always 0 - every target would report
+          # BUILT even when the compiler failed.
+          set -u -o pipefail
           TARGETS="dynarmic common core hid_core audio_core shader_recompiler video_core network input_common frontend_common"
           echo "| target | result |" >  result.md
           echo "|---|---|"           >> result.md

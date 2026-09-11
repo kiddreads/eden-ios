@@ -4,6 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#if defined(__APPLE__)
+// Needed before the platform include block below: TARGET_OS_IPHONE distinguishes iOS
+// from macOS, and the two do not have the same headers available.
+#include <TargetConditionals.h>
+#endif
+
 #ifdef _WIN32
 
 #include <iterator>
@@ -27,7 +33,12 @@
 #include <sys/random.h>
 #elif defined(__APPLE__)
 #include <sys/types.h>
+#if !TARGET_OS_IPHONE
+// Not present in the iOS SDK. Nothing in this file actually uses it - the only
+// randomness here comes from <random>, and is explicitly not cryptographic - so it
+// is simply left out rather than replaced.
 #include <sys/random.h>
+#endif
 #include <mach/vm_map.h>
 #include <mach/mach.h>
 #elif defined(__FreeBSD__)
@@ -50,10 +61,6 @@
 #endif
 
 #endif // ^^^ POSIX ^^^
-
-#if defined(__APPLE__)
-#include <TargetConditionals.h>
-#endif
 
 // The fastmem arena maps guest pages directly into the host address space so that a
 // guest load becomes a host load. That requires host pages no larger than guest pages.

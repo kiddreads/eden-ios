@@ -14,7 +14,11 @@ extern std::atomic<bool> g_has_battery;
 
 #elif defined(__APPLE__)
 #include <TargetConditionals.h>
-#if TARGET_OS_MAC
+// TARGET_OS_MAC is 1 on every Apple platform, iOS included - it means "Mac family",
+// not "macOS". TARGET_OS_OSX is the one that means desktop macOS. IOKit power sources
+// are not in the iOS SDK, so guarding on TARGET_OS_MAC pulled a header that does not
+// exist there. iOS falls through to the default PowerStatus for now.
+#if TARGET_OS_OSX
 #include <IOKit/ps/IOPSKeys.h>
 #include <IOKit/ps/IOPowerSources.h>
 #endif
@@ -49,7 +53,7 @@ namespace Common {
         info.charging = g_is_charging.load(std::memory_order_relaxed);
         info.has_battery = g_has_battery.load(std::memory_order_relaxed);
 
-#elif defined(__APPLE__) && TARGET_OS_MAC
+#elif defined(__APPLE__) && TARGET_OS_OSX
         CFTypeRef info_ref = IOPSCopyPowerSourcesInfo();
         CFArrayRef sources = IOPSCopyPowerSourcesList(info_ref);
         if (CFArrayGetCount(sources) > 0) {
