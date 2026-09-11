@@ -54,12 +54,18 @@ jobs:
           df -h / | tail -1
 
       # Eden requires CMake 3.31+. The runner image lags, so install explicitly.
+      # glslang provides glslangValidator, which src/video_core/host_shaders compiles
+      # the built-in shaders with at configure time. It is a HOST tool - it runs on the
+      # runner, not on the device - so it is installed normally and the toolchain leaves
+      # CMAKE_FIND_ROOT_PATH_MODE_PROGRAM as BOTH so find_program can still see it.
       - name: Install build tools
         run: |
           brew update --quiet || true
-          brew install cmake ninja || brew upgrade cmake ninja || true
+          brew install cmake ninja glslang || brew upgrade cmake ninja glslang || true
           cmake --version
           ninja --version
+          echo "glslangValidator: $(command -v glslangValidator || echo MISSING)"
+          glslangValidator --version 2>&1 | head -3 || true
 
       # Eden fetches dependencies with CPM at configure time. Cache them or every
       # run re-downloads the same archives.
