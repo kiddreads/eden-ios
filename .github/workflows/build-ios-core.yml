@@ -111,6 +111,7 @@ jobs:
             -DENABLE_WIFI_SCAN=OFF \
             -DYUZU_TESTS=OFF \
             -DBUILD_TESTING=OFF \
+            -DENABLE_LIBRETRO=ON \
             -DYUZU_DISABLE_LLVM=ON \
             -DYUZU_USE_BUNDLED_FFMPEG=ON \
             -DYUZU_USE_BUNDLED_SIRIT=ON \
@@ -148,7 +149,11 @@ jobs:
           # pipeline's status is tee's, which is always 0 - every target would report
           # BUILT even when the compiler failed.
           set -u -o pipefail
-          TARGETS="dynarmic common core hid_core audio_core shader_recompiler video_core network input_common frontend_common"
+          # eden_libretro goes LAST on purpose: it links core, video_core, hid_core and
+          # input_common, so it cannot be green before they are, and building it last keeps
+          # the failure digest pointing at the real first failure rather than at a
+          # downstream consequence of it.
+          TARGETS="dynarmic common core hid_core audio_core shader_recompiler video_core network input_common frontend_common eden_libretro"
           echo "| target | result |" >  result.md
           echo "|---|---|"           >> result.md
           for t in $TARGETS; do
