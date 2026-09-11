@@ -28,6 +28,7 @@
 #endif
 
 #ifdef __APPLE__
+#include <TargetConditionals.h> // Used to tell iOS apart from macOS
 #include <sys/param.h> // Used in GetBundleDirectory()
 
 // CFURL contains __attribute__ directives that gcc does not know how to parse, so we need to just
@@ -127,6 +128,19 @@ public:
         LEGACY_PATH(Suyu, SUYU)
 #undef LEGACY_PATH
 #elif __ANDROID__
+        ASSERT(!eden_path.empty());
+        eden_path_cache = eden_path / CACHE_DIR;
+        eden_path_config = eden_path / CONFIG_DIR;
+#elif defined(__APPLE__) && defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        // iOS behaves like Android here, not like desktop: the app container is the only
+        // writable location, the frontend is the only thing that knows where it is, and
+        // there is no portable directory or XDG environment to fall back on.
+        //
+        // Without this branch iOS fell through to the desktop path below, whose first
+        // statement assigns over eden_path - so SetAppDirectory()'s argument was silently
+        // discarded and everything landed in $HOME/.local/share/eden inside the container.
+        // That is writable, so nothing appeared to be wrong, but it is dot-hidden and so
+        // invisible to Files.app, which is where a user has to put prod.keys and firmware.
         ASSERT(!eden_path.empty());
         eden_path_cache = eden_path / CACHE_DIR;
         eden_path_config = eden_path / CONFIG_DIR;
