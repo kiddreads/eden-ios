@@ -61,10 +61,11 @@ jobs:
       - name: Install build tools
         run: |
           brew update --quiet || true
-          brew install cmake ninja glslang || brew upgrade cmake ninja glslang || true
+          brew install cmake ninja glslang ccache || brew upgrade cmake ninja glslang ccache || true
           cmake --version
           ninja --version
           echo "glslangValidator: $(command -v glslangValidator || echo MISSING)"
+          echo "ccache: $(command -v ccache || echo MISSING)"
           glslangValidator --version 2>&1 | head -3 || true
 
       # Eden fetches dependencies with CPM at configure time. Cache them or every
@@ -75,6 +76,24 @@ jobs:
           path: .cache/cpm
           key: cpm-ios-${{ hashFiles('cpmfile.json', 'CMakeModules/CPMUtil.cmake') }}
           restore-keys: cpm-ios-
+
+      # Without this every run recompiles the whole engine - roughly twenty minutes -
+      # to find out whether one file in src/libretro_core still has a typo in it. The
+      # key rotates per run so each build writes a fresh entry, and restore-keys picks
+      # up the most recent previous one.
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-ios-${{ github.sha }}
+          restore-keys: |
+            ccache-ios-
+
+      - name: Prime ccache
+        run: |
+          ccache --max-size=2G
+          ccache --zero-stats
+          ccache --show-config | head -5
 
       # ---------------------------------------------------------------------
       # Configure.
@@ -112,6 +131,7 @@ jobs:
             -DYUZU_TESTS=OFF \
             -DBUILD_TESTING=OFF \
             -DENABLE_LIBRETRO=ON \
+            -DUSE_CCACHE=ON \
             -DYUZU_DISABLE_LLVM=ON \
             -DYUZU_USE_BUNDLED_FFMPEG=ON \
             -DYUZU_USE_BUNDLED_SIRIT=ON \
@@ -211,6 +231,10 @@ jobs:
           # The A64 frontend is what actually runs Switch code; check it too.
           A64=$(nm -g "$LIB" 2>/dev/null | grep -c "A64" || true)
           echo "symbols matching A64: $A64"
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats || true
 
       - name: Summary
         if: always()
