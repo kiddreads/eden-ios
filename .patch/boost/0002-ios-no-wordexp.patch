@@ -1,0 +1,45 @@
+--- a/libs/process/src/shell.cpp
++++ b/libs/process/src/shell.cpp
+@@ -16,10 +16,23 @@
+ #include <boost/process/v2/error.hpp>
+ #include <boost/process/v2/shell.hpp>
+ 
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
++
++// wordexp() is declared but marked unavailable in the iOS SDK, so merely referencing it
++// is a hard compile error there. OpenBSD and Android are already excluded below and fall
++// through to the ENOTSUP implementation at the bottom of this file; iOS needs the same
++// treatment. Expressed as one macro so the three sites below stay in agreement.
++#if defined(__OpenBSD__) || defined(__ANDROID__) || \
++    (defined(__APPLE__) && defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
++#define BOOST_PROCESS_V2_NO_WORDEXP 1
++#endif
++
+ #if defined(BOOST_PROCESS_V2_WINDOWS)
+ #include <windows.h>
+ #include <shellapi.h>
+-#elif !defined(__OpenBSD__) && !defined(__ANDROID__)
++#elif !defined(BOOST_PROCESS_V2_NO_WORDEXP)
+ #include <wordexp.h>
+ #endif
+ 
+@@ -30,7 +43,7 @@
+ {
+     return system_category();
+ }
+-#elif !defined(__OpenBSD__) && !defined(__ANDROID__)
++#elif !defined(BOOST_PROCESS_V2_NO_WORDEXP)
+ 
+ struct shell_category_t final : public error_category
+ {
+@@ -99,7 +112,7 @@
+     return input_.c_str();
+ }
+ 
+-#elif !defined(__OpenBSD__) && !defined(__ANDROID__)
++#elif !defined(BOOST_PROCESS_V2_NO_WORDEXP)
+ 
+ void shell::parse_()
+ {
