@@ -210,7 +210,10 @@ jobs:
       # libdynarmic.a built green with no JIT backend in it. "It compiled" is not the
       # claim this gate is meant to support - "the JIT is in the binary" is.
       - name: Check libdynarmic.a actually contains the arm64 backend
-        if: steps.configure.outcome == 'success'
+        # always(), not just on success: when a later target fails, whether the JIT made
+        # it into the archive is exactly the evidence worth keeping. The previous run
+        # skipped this step because eden_libretro failed after dynarmic had built fine.
+        if: always() && steps.configure.outcome == 'success'
         run: |
           set -u
           LIB=$(find build -name 'libdynarmic.a' | head -1)

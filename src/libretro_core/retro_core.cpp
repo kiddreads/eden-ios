@@ -243,7 +243,12 @@ void StopEmulation() {
 }
 
 bool LoadGameInternal(const std::string& path) {
-    void(LibretroCore::Content::SetupUserPaths());
+    // static_cast, not void(...). `void(Qualified::Name())` is the vexing parse: the
+    // compiler reads it as declaring a function named Qualified::Name returning void,
+    // which is illegal inside a function body. The void(...) idiom elsewhere in this
+    // directory is fine because those calls take arguments, which forces the expression
+    // reading; this one takes none.
+    static_cast<void>(LibretroCore::Content::SetupUserPaths());
     LibretroCore::Content::AdoptKeys();
 
     ApplyPreLoadSettings();

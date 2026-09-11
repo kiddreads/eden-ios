@@ -1,0 +1,228 @@
+# SPDX-FileCopyrightText: Copyright 2026 eden-ios contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# XcodeGen spec for the eden-ios app shell.
+#
+# Generate with:   cd src/ios && xcodegen generate
+# Build with:      xcodebuild -project Eden-iOS.xcodeproj -scheme Eden -sdk iphoneos \
+#                    -configuration Release CODE_SIGNING_ALLOWED=NO build
+#
+# Modelled on /Users/kiddreads/cemu-ios-muffin/src/ios/project.yml, which produces a
+# working iOS IPA with no local Xcode. The patterns copied from it are: link against
+# the CMake-built static archives through a generated linker RESPONSE FILE rather than
+# -l<name> + LIBRARY_SEARCH_PATHS; one application target; a preBuildScript that
+# regenerates that response file every build.
+#
+# ---------------------------------------------------------------------------
+# WHAT IS DELIBERATELY *NOT* COPIED FROM CEMU, AND WHY
+# ---------------------------------------------------------------------------
+# cemu-ios-muffin's spec spends ~40 lines on CLANG_CXX_LANGUAGE_DIALECT, raw
+# -std=gnu++20 in OTHER_CPLUSPLUSFLAGS, GCC_PREFIX_HEADER pointing at Cemu's
+# precompiled.h, and a GCC_PREPROCESSOR_DEFINITIONS list (CEMU_PLATFORM_IOS=1,
+# ENABLE_METAL=1, HAS_COREAUDIO=1). Every one of those exists because
+# src/ios/Bridge/CemuBridge.mm is Objective-C++ that includes Cemu's own C++ engine
+# headers, so Xcode has to reproduce CMake's entire compile environment.
+#
+# This target has none of that, on purpose. The ONLY core headers it includes are:
+#   src/libretro_core/eden_libretro.h  - wrapped in `extern "C"`, includes <stdbool.h>
+#   src/libretro_core/libretro.h       - plain C, the upstream libretro ABI
+# Both are C. So every file under Bridge/ is Objective-C (.m), never Objective-C++,
+# and no C++ dialect, prefix header, or preprocessor-define replication is needed.
+#
+# THIS IS A LOAD-BEARING CONSTRAINT, NOT AN AESTHETIC ONE. The moment one .m becomes
+# a .mm that includes an Eden C++ header (core/core.h, video_core/gpu.h, ...) all of
+# cemu's 40 lines come back, plus Eden's include tree, plus its -D flags. If that ever
+# becomes necessary, do it by adding a *separate* C shim compiled by CMake inside
+# libeden_libretro.a and calling that from here - do not widen this target.
+#
+# ---------------------------------------------------------------------------
+# WHAT THE CMAKE SIDE MUST HAVE PRODUCED FIRST
+# ---------------------------------------------------------------------------
+# ci/generate-link-flags.sh hard-fails if the core has not been built, so configure and
+# build the CMake tree before xcodebuild. The app workflow does this; by hand it is:
+#
+#   cmake -B build-ios -G Ninja \
+#     -DCMAKE_TOOLCHAIN_FILE="$PWD/CMakeModules/toolchains/iOS.cmake" \
+#     -DENABLE_LIBRETRO=ON  ... (see .github/workflows/build-ios-core.yml)
+#   cmake --build build-ios --target eden_libretro
+#
+name: Eden-iOS
+
+options:
+  bundleIdPrefix: dev.edenios
+  deploymentTarget:
+    iOS: '15.0'
+  createIntermediateGroups: true
+
+settings:
+  base:
+    PRODUCT_NAME: Eden
+    # Keys the data container. Changing it after anything is installed on a device
+    # orphans that device's keys, firmware, saves and NAND directory.
+    PRODUCT_BUNDLE_IDENTIFIER: dev.edenios.Eden
+    SDKROOT: iphoneos
+    IPHONEOS_DEPLOYMENT_TARGET: '15.0'
+    # iPhone and iPad, per docs/IOS_PORT_NOTES.md. Declared here AND in Info.plist;
+    # the plist is what actually ships, this keeps Xcode's own checks agreeing.
+    TARGETED_DEVICE_FAMILY: '1,2'
+    ARCHS: arm64
+    # The simulator cannot run a JIT, and CMakeModules/toolchains/iOS.cmake builds
+    # device-only archives (CMAKE_OSX_SYSROOT iphoneos, CMAKE_OSX_ARCHITECTURES arm64),
+    # so a simulator build could never link anyway.
+    SUPPORTS_MACCATALYST: 'NO'
+    ONLY_ACTIVE_ARCH: 'NO'
+
+    # --- Info.plist -------------------------------------------------------
+    # A REAL file, with generation OFF. cemu-ios-muffin's project.yml carries a note
+    # verified against a shipped IPA: xcodebuild's GENERATE_INFOPLIST_FILE +
+    # INFOPLIST_FILE merge silently DROPS UIFileSharingEnabled while keeping
+    # LSSupportsOpeningDocumentsInPlace, even though both land identically in the
+    # generated pbxproj. Both keys are mandatory here - without them the Documents
+    # tree that holds prod.keys and firmware is invisible in Files.app and every path
+    # the in-app setup guide quotes is a lie. Sidestepping the merge entirely is
+    # cheaper than reproducing the bug.
+    GENERATE_INFOPLIST_FILE: 'NO'
+    INFOPLIST_FILE: Info.plist
+
+    # --- Bridging ---------------------------------------------------------
+    SWIFT_OBJC_BRIDGING_HEADER: Bridge/Eden-Bridging-Header.h
+    SWIFT_VERSION: '5.0'
+    CLANG_ENABLE_MODULES: 'YES'
+    # Bridge/*.m use ARC-managed CAMetalLayer/UIView; EdenJIT.m is plain POSIX.
+    CLANG_ENABLE_OBJC_ARC: 'YES'
+
+    # Two entries, both needed. retro_core.cpp itself includes "libretro.h" bare and
+    # "libretro_core/eden_libretro.h" prefixed, so the header tree supports both
+    # spellings; the bridge uses the prefixed form and this covers either.
+    HEADER_SEARCH_PATHS:
+      - '$(SRCROOT)/..'
+      - '$(SRCROOT)/../libretro_core'
+
+    # --- Linking ----------------------------------------------------------
+    # @-prefixed linker response file written by the preBuildScript below. Full paths,
+    # not -l<name>: CMake scatters .a outputs across build-ios/src/*, build-ios/_deps/*
+    # and externals, and cemu-ios-muffin's script exists precisely because every
+    # hand-listed LIBRARY_SEARCH_PATHS entry produced a fresh "library not found" for
+    # an archive that was sitting on disk the whole time.
+    OTHER_LDFLAGS: '@$(SRCROOT)/link-flags.txt $(inherited)'
+
+    # SDL3 is linked unconditionally by audio_core (src/audio_core/CMakeLists.txt:245)
+    # and by input_common (src/input_common/CMakeLists.txt:82), and its iOS backends
+    # are Objective-C categories registered at runtime. Without -ObjC those object
+    # files are dropped from a static archive and the failure is a runtime
+    # "unrecognized selector", not a link error - which is far more expensive to
+    # diagnose than the binary-size cost of keeping them.
+    OTHER_LDFLAGS[arch=arm64]: '-ObjC @$(SRCROOT)/link-flags.txt $(inherited)'
+
+    # Eden's archives are C++ and reference libc++ symbols. CMake adds this implicitly;
+    # Xcode linking pre-built archives does not.
+    CLANG_CXX_LIBRARY: libc++
+
+    MARKETING_VERSION: '0.1.0'
+    CURRENT_PROJECT_VERSION: '1'
+
+    # No ASSETCATALOG_COMPILER_APPICON_NAME. There is no Assets.xcassets in this tree
+    # yet, and naming an icon set that does not exist is a hard build error. Add both
+    # together, never the setting alone.
+
+  configs:
+    # Entitlements per configuration only matter for a LOCALLY signed build. CI builds
+    # with CODE_SIGNING_ALLOWED=NO and then ad-hoc re-signs the one .app three times,
+    # once per entitlements file, so under CI these two lines are inert. A Debug build
+    # IS the debugger-attached case, which is exactly what StikDebug reproduces.
+    debug:
+      CODE_SIGN_ENTITLEMENTS: Eden-Debug.entitlements
+      SWIFT_OPTIMIZATION_LEVEL: '-Onone'
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+      GCC_PREPROCESSOR_DEFINITIONS: 'DEBUG=1 $(inherited)'
+    release:
+      CODE_SIGN_ENTITLEMENTS: Eden.entitlements
+      SWIFT_OPTIMIZATION_LEVEL: '-O'
+      # -dead_strip is Xcode's default for Release. It is safe here: nothing in this
+      # app is reached only by dlsym. In particular MoltenVK is NOT statically linked
+      # (see the frameworks note below), so there are no vk* symbols to strip.
+      DEAD_CODE_STRIPPING: 'YES'
+
+targets:
+  Eden:
+    type: application
+    platform: iOS
+    deploymentTarget: '15.0'
+
+    sources:
+      - path: App
+        type: group
+      - path: Bridge
+        type: group
+
+    # ---------------------------------------------------------------------
+    # Frameworks.
+    #
+    # The first seven mirror the iOS branch of the top-level CMakeLists.txt
+    # (CMakeLists.txt:522-531 - Metal, CoreVideo, CoreMedia, Security,
+    # UniformTypeIdentifiers, Foundation, UIKit). CMake links those into the archives;
+    # Xcode linking the archives afterwards does not inherit that, so they are repeated
+    # here or every symbol they provide is undefined at link.
+    #
+    # The rest are what SDL3's iOS backends reference. cemu-ios-muffin discovered the
+    # equivalent list for SDL2 empirically, one undefined symbol at a time
+    # (_AVAudioSessionCategoryAmbient, _AudioQueueAllocateBuffer,
+    # _GCControllerDidConnectNotification, _CHHapticEventTypeHapticContinuous,
+    # _CBAdvertisementDataLocalNameKey) - see ci/generate-link-flags.sh in that repo.
+    # Listing them up front is cheaper than rediscovering them.
+    #
+    # NOT LISTED: MoltenVK, in any form. Verified: MOLTENVK_LIBRARY is referenced only
+    # by externals/CMakeLists.txt:436-443 (which sets it) and src/yuzu/CMakeLists.txt
+    # :385-391 (the Qt desktop app, built with ENABLE_QT=OFF here). Nothing in the iOS
+    # target links it. Vulkan is resolved at RUNTIME by dlopen in
+    # src/video_core/vulkan_common/vulkan_library.cpp:28-53, whose iOS branch tries
+    # $LIBVULKAN_PATH, then <bundle>/Frameworks/libMoltenVK.dylib, then
+    # <bundle>/Frameworks/libvulkan.1.dylib, then dlopen(nullptr). So MoltenVK is a
+    # RUNTIME dependency delivered as an embedded dylib, not a link-time one - and the
+    # app links successfully whether or not it is present.
+    dependencies:
+      - sdk: UIKit.framework
+      - sdk: Foundation.framework
+      - sdk: QuartzCore.framework      # CAMetalLayer
+      - sdk: Metal.framework
+      - sdk: CoreVideo.framework
+      - sdk: CoreMedia.framework
+      - sdk: Security.framework
+      - sdk: UniformTypeIdentifiers.framework
+      - sdk: SwiftUI.framework
+      - sdk: AVFoundation.framework
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudio.framework
+      - sdk: CoreHaptics.framework
+      - sdk: CoreBluetooth.framework
+      - sdk: GameController.framework
+      - sdk: CoreMotion.framework
+      # VideoToolbox: externals/ffmpeg may build a videotoolbox hwaccel. I searched
+      # externals/ffmpeg/CMakeLists.txt and found mediacodec, vaapi, nvdec and vdpau
+      # branches but no videotoolbox one, and did not read the whole file. Keeping it
+      # costs nothing (frameworks are weak-by-default for unreferenced symbols) and
+      # removes one class of undefined symbol; drop it if the link is proven clean.
+      - sdk: VideoToolbox.framework
+
+    preBuildScripts:
+      - name: Generate linker response file for the CMake-built archives
+        # Correctness beats skipping a sub-second find: the set of .a files changes
+        # whenever the CMake tree is reconfigured, and a stale response file fails the
+        # link in a way that looks like a source error.
+        basedOnDependencyAnalysis: false
+        script: |
+          "$SRCROOT/../../ci/generate-link-flags.sh" "$SRCROOT/link-flags.txt"
+
+    postBuildScripts:
+      # postBuild, not preBuild: the .app it writes into does not exist yet when a
+      # pre-build script runs. This is non-fatal when the dylib is absent - cut one is
+      # expected to link and package without MoltenVK, and fail at GPU init on device
+      # rather than at build time.
+      - name: Embed libMoltenVK.dylib into the app bundle
+        basedOnDependencyAnalysis: false
+        script: |
+          "$SRCROOT/../../ci/fetch-moltenvk.sh" --embed "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH"
+
+    scheme:
+      gatherCoverageData: false
+      testTargets: []
