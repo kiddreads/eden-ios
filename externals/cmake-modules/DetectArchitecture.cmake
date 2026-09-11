@@ -36,7 +36,13 @@ This file is based off of Yuzu and Dynarmic.
 # should NOT be too dependent on the architecture
 # otherwise, you may end up with duplicate code
 if (CMAKE_OSX_ARCHITECTURES)
-    set(MULTIARCH_BUILD 1)
+    # Only a genuinely universal build is multiarch. Setting CMAKE_OSX_ARCHITECTURES to a
+    # single value - which any iOS toolchain must do - previously turned MULTIARCH_BUILD on
+    # and sent every architecture-specific source through the wrapping path for no reason.
+    list(LENGTH CMAKE_OSX_ARCHITECTURES EDEN_OSX_ARCH_COUNT)
+    if (EDEN_OSX_ARCH_COUNT GREATER 1)
+        set(MULTIARCH_BUILD 1)
+    endif()
     set(ARCHITECTURE "${CMAKE_OSX_ARCHITECTURES}")
 
     # hope and pray the architecture names match

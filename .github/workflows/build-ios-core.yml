@@ -179,6 +179,34 @@ jobs:
             exit 1
           fi
 
+      # A library can compile, archive and link perfectly while containing nothing.
+      # That is not hypothetical here: every backend/arm64 source was being wrapped in
+      # `#if defined(ARCHITECTURE_ARM64)` while the build defined ARCHITECTURE_arm64, so
+      # libdynarmic.a built green with no JIT backend in it. "It compiled" is not the
+      # claim this gate is meant to support - "the JIT is in the binary" is.
+      - name: Check libdynarmic.a actually contains the arm64 backend
+        if: steps.configure.outcome == 'success'
+        run: |
+          set -u
+          LIB=$(find build -name 'libdynarmic.a' | head -1)
+          if [ -z "$LIB" ]; then
+            echo "::error::libdynarmic.a was never produced"; exit 1
+          fi
+          echo "archive: $LIB ($(du -h "$LIB" | cut -f1))"
+          echo "objects: $(ar -t "$LIB" | wc -l | tr -d ' ')"
+          SYMS=$(nm -g "$LIB" 2>/dev/null | grep -c "Arm64" || true)
+          echo "symbols matching Arm64: $SYMS"
+          if [ "$SYMS" -lt 1 ]; then
+            echo "::error::libdynarmic.a contains no Arm64 backend symbols - the JIT is not in the archive"
+            echo "--- objects that are suspiciously empty ---"
+            ar -t "$LIB" | head -40
+            exit 1
+          fi
+          echo "arm64 backend is present in the archive"
+          # The A64 frontend is what actually runs Switch code; check it too.
+          A64=$(nm -g "$LIB" 2>/dev/null | grep -c "A64" || true)
+          echo "symbols matching A64: $A64"
+
       - name: Summary
         if: always()
         run: |
