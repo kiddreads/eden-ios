@@ -101,9 +101,9 @@ so a device without JIT permission killed the app before any UI could explain wh
 - The Switch gives games ~3.2 GB. Builds need
   `com.apple.developer.kernel.increased-memory-limit`, and
   `com.apple.developer.kernel.extended-virtual-addressing` on some devices.
-- Unmeasured: the code cache is 128 MiB per core. Whether iOS jetsam counts `MAP_JIT`
-  reservations as dirty decides whether this fits on a 6 GB device at all. Needs measuring, not
-  reasoning about.
+- Unmeasured: the code cache is 128 MiB per core. Whether iOS jetsam counts a large RX mapping
+  as dirty against the app's footprint decides whether this fits on a 6 GB device at all. Needs
+  measuring, not reasoning about.
 
 ## Things that are already handled, so don't rewrite them
 
@@ -122,8 +122,9 @@ Stated so nobody treats them as established:
 
 - Which mandatory Vulkan features MoltenVK actually lacks on which Apple GPU family. Nothing in
   this port has read MoltenVK's source or run it.
-- Whether `mmap(MAP_JIT)` succeeds on a `CS_DEBUGGED` process that lacks the JIT entitlement.
-  This decides whether the `mprotect` fallback is the primary path on StikDebug installs or dead
-  code.
+- Whether `mprotect(PROT_READ | PROT_EXEC)` on anonymous memory actually succeeds under
+  StikDebug's `CS_DEBUGGED` on current iOS, and separately under TrollStore's
+  `dynamic-codesigning`. Both are believed to work and neither has been run here. If both fail on
+  a device, there is no fallback left.
 - Whether a second `Core::System::Load` after `ShutdownMainProcess` works. Reasoned from the
   source, never executed.
