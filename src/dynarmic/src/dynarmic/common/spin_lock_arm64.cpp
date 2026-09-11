@@ -50,7 +50,21 @@ struct SpinLockImpl {
 };
 
 std::once_flag flag;
-SpinLockImpl impl;
+
+// Constructed on first use rather than at namespace scope. SpinLockImpl's constructor
+// allocates an oaknut::CodeBlock, which mmaps executable memory - as a global that ran
+// during static initialisation, i.e. at dyld load, before main() and before any UI could
+// exist. On a platform where executable memory has to be granted (iOS without StikDebug or
+// the JIT entitlement) that allocation fails, and failing there means the process dies
+// before it can tell anyone why. Deferring it to first use moves the failure to a point
+// where the application is running and can report it.
+//
+// Function-local statics are initialised thread-safely since C++11, so this does not need
+// its own guard, and it also removes a static-initialisation-order dependency.
+SpinLockImpl& Impl() noexcept {
+    static SpinLockImpl impl;
+    return impl;
+}
 
 SpinLockImpl::SpinLockImpl()
         : mem{4096}
@@ -74,11 +88,13 @@ void SpinLockImpl::Initialize() {
 }  // namespace
 
 void SpinLock::Lock() noexcept {
+    SpinLockImpl& impl = Impl();
     std::call_once(flag, &SpinLockImpl::Initialize, impl);
     impl.lock(&storage);
 }
 
 void SpinLock::Unlock() noexcept {
+    SpinLockImpl& impl = Impl();
     std::call_once(flag, &SpinLockImpl::Initialize, impl);
     impl.unlock(&storage);
 }
