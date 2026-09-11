@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- TROLLSTORE variant. Mirrors src/ios/Eden-TrollStore.entitlements minus the
+	     memory keys.
+
+	     dynamic-codesigning is THE key. docs/IOS_PORT_NOTES.md: oaknut "maps plain
+	     anonymous memory and toggles it between RX and RW with mprotect. That requires
+	     the process to be allowed to do it: dynamic-codesigning (TrollStore), or being
+	     debugged, which sets CS_DEBUGGED (StikDebug)."
+
+	     If the sideload variant FAILS and this one PASSES, that difference is the
+	     finding: JIT on this device requires a TrollStore-class install, and Eden's
+	     distribution story has to say so.
+
+	     File naming: capital S in TrollStore. macOS filesystems are case-insensitive by
+	     default, so a sibling named -trollstore.entitlements is the SAME FILE and one
+	     silently overwrites the other. One spelling only - the same note is on
+	     src/ios/Eden-TrollStore.entitlements. -->
+	<key>dynamic-codesigning</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.disable-executable-page-protection</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>

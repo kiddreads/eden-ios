@@ -7,7 +7,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 suyu Emulator Project
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 //
-// TWO VERIFIED DEFECTS IN SUYU'S VERSION ARE FIXED HERE, NOT PORTED:
+// FIVE VERIFIED DEFECTS ARE FIXED HERE, NOT PORTED. The first two are suyu's; the
+// third and fifth are this file's own, found in review; the fourth is upstream Eden's
+// and is worked around rather than fixed, because touch_screen.cpp is not this port's
+// file to change.
 //
 //  1. WRONG PORT IN HANDHELD MODE. suyu hardcodes VirtualGamepad player_index 0
 //     (suyu retro_core.cpp:335, :341, :345). EmulatedController::LoadVirtualGamepadParams
@@ -27,6 +30,32 @@
 //     initialiser (src/common/settings_input.h:383-384), so with no config file every
 //     controller is connected == false and that call actively disconnects everything
 //     it just built. ConnectPlayers() fills the settings in first.
+//
+//  3. HELD BUTTONS STRANDED ON A PORT CHANGE. prev_buttons is keyed on the LIBRETRO
+//     port, but the VirtualGamepad port it is written to is re-read live every poll by
+//     VirtualPortFor() - and it genuinely can change mid-session, because the guest's
+//     own HID service calls EmulatedController::SetNpadStyleIndex
+//     (src/hid_core/resources/npad/npad.cpp:815). Before this fix, a change from
+//     virtual port 8 to 0 left every button that was down at that instant latched
+//     `true` inside VirtualGamepad's port-8 state - nothing ever wrote `false` there,
+//     because prev_buttons still agreed with the pad and suppressed the edge, and the
+//     sticks stayed frozen at their last deflection for the same reason. PollPad() now
+//     tracks the binding in bound_port[], releases the port it is leaving, drives the
+//     port it is arriving at to a known baseline, and clears prev so that whatever is
+//     physically held is re-asserted on the new port the same frame.
+//
+//  4. FINGER ID 0 IS SELF-CANCELLING IN TouchScreen. See RetroInput::FingerIdBias in
+//     the header: TouchScreen::ReleaseInactiveTouch() releases on behalf of unused
+//     slots whose finger_id is a value-initialised 0, so a live finger numbered 0 is
+//     released on the same call that pressed it. Every id this file passes is biased
+//     by one so the lookup finds nothing. yuzu's Qt frontend drives the same polled
+//     protocol (src/yuzu/bootmanager.cpp:584-590) and has the same exposure.
+//
+//  5. ACCELEROMETER SCALED BY 1/9.80665 THAT SHOULD NOT HAVE BEEN. Both libretro and
+//     Eden measure acceleration in g; the conversion was a units error in one
+//     direction against a unit that was never m/s^2. See the kRadPerSecToRevPerSec /
+//     accelerometer comment block below for the citations and for why the consequence
+//     is worse than a wrong scale.
 
 #include <algorithm>
 #include <vector>
@@ -88,15 +117,30 @@ constexpr retro_controller_info kControllerInfo[] = {
     {nullptr, 0},
 };
 
+// GYRO: libretro -> Eden needs a unit conversion.
+//
 // MotionInput clamps gyro at GyroMaxValue = 5.0f and integrates it as
 // `rotations += gyro * seconds`, where rotations is documented as "Number of full
 // rotations in each axis" (src/hid_core/frontend/motion_input.h:25, :87). The unit is
 // REVOLUTIONS per second; the "radians/s" comment at motion_input.h:93 is stale -
-// 5 rad/s would be a clamp below one turn per second. libretro's sensor gyro is rad/s.
+// 5 rad/s would be a clamp below one turn per second. Confirmed independently by
+// MotionInput::UpdateOrientation, which converts the stored value back with
+// `auto rad_gyro = gyro * std::numbers::pi_v<float> * 2.f` (motion_input.cpp:150):
+// multiplying by 2*pi to reach radians only makes sense if the stored unit is turns.
+// libretro's sensor gyro is documented as radians per second (libretro.h:4669).
 constexpr float kRadPerSecToRevPerSec = 1.0f / 6.28318530717958647692f;
 
-// MotionInput wants G (motion_input.h:90, AccelMaxValue 7.0f); libretro's is m/s^2.
-constexpr float kMetresPerSecSqToG = 1.0f / 9.80665f;
+// ACCELEROMETER: no conversion. Both sides are already in g.
+//
+// This file previously divided by 9.80665, and that was wrong. libretro.h:4641-4643
+// says RETRO_SENSOR_ACCELEROMETER_* returns acceleration "in g (standard gravity,
+// 9.80665 m/s^2) ... a device at rest on a table will have values close to 0, 0, 1",
+// and MotionInput documents its own accel as "Acceleration vector measurement in G
+// force" (motion_input.h:90, AccelMaxValue 7.0f). Dividing an already-g value by 9.8
+// made gravity read as 0.102 g, which is not merely a scale error: it falls outside
+// the [0.75, 1.25] window UpdateOrientation requires before it will apply any drift
+// correction at all (motion_input.cpp:165), so the orientation estimate would never
+// converge and gyro aiming would drift without bound.
 
 RetroInput g_retro_input;
 
@@ -120,6 +164,10 @@ void RetroInput::SetEnvironment(retro_environment_t cb) {
     if (environ_cb(RETRO_ENVIRONMENT_GET_SENSOR_INTERFACE, &sensors) &&
         sensors.get_sensor_input != nullptr) {
         sensors_available = true;
+    } else {
+        LOG_INFO(Frontend,
+                 "libretro: frontend has no sensor interface - the emulated console and "
+                 "both Joy-Cons will report a motionless six-axis for the whole session");
     }
 }
 
@@ -150,7 +198,18 @@ void RetroInput::SetPortDevice(unsigned port, unsigned device) {
     if (port >= MaxPlayers) {
         return;
     }
-    port_enabled[port] = (device != RETRO_DEVICE_NONE);
+    const bool enabled = (device != RETRO_DEVICE_NONE);
+    if (!enabled && port_enabled[port]) {
+        // Same stranding as a port change, by a different route: Poll() stops calling
+        // PollPad for a disabled port, so anything held at the moment of the unplug
+        // would stay latched inside VirtualGamepad forever.
+        if (bound_port[port] != UnboundPort) {
+            ReleaseVirtualPort(bound_port[port]);
+            bound_port[port] = UnboundPort;
+        }
+        prev_buttons[port] = {};
+    }
+    port_enabled[port] = enabled;
     if (loaded) {
         ConnectPlayers();
     }
@@ -160,6 +219,7 @@ void RetroInput::OnGameLoaded(Core::System& system_, InputCommon::InputSubsystem
     system = &system_;
     input = &subsystem;
     prev_buttons = {};
+    bound_port.fill(UnboundPort);
     port_enabled[0] = true; // port 0 is always present
 
     ConnectPlayers();
@@ -228,15 +288,47 @@ void RetroInput::ConnectPlayers() {
 std::size_t RetroInput::VirtualPortFor(unsigned retro_port) const {
     // See the header comment, defect 1. Re-read live each call so a mid-session
     // docked/handheld change is followed without re-entering this function's caller.
+    // Defect 3 is the consequence of that liveness and is handled in PollPad().
     if (retro_port != 0 || system == nullptr) {
         return retro_port;
     }
-    const auto* player_one = system->HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
+    const auto* player_one =
+        system->HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
     if (player_one != nullptr &&
         player_one->GetNpadStyleIndex() == Core::HID::NpadStyleIndex::Handheld) {
         return HandheldPort;
     }
     return 0;
+}
+
+void RetroInput::ReleaseVirtualPort(std::size_t virtual_port) {
+    if (input == nullptr) {
+        return;
+    }
+    auto* vgp = input->GetVirtualGamepad();
+    if (vgp == nullptr) {
+        return;
+    }
+
+    // VirtualButton is a contiguous 0..19 enumeration (virtual_gamepad.h:15-34) and
+    // SetButtonState(std::size_t, int, bool) takes the raw id (virtual_gamepad.h:51),
+    // so one loop covers every button on this port - including ButtonSL, ButtonSR,
+    // ButtonHome and ButtonCapture, which kPadMap cannot reach but a future frontend
+    // path might.
+    for (std::size_t button_id = 0; button_id < NumVirtualButtons; ++button_id) {
+        vgp->SetButtonState(virtual_port, static_cast<int>(button_id), false);
+    }
+    vgp->SetStickPosition(virtual_port, VS::Left, 0.0f, 0.0f);
+    vgp->SetStickPosition(virtual_port, VS::Right, 0.0f, 0.0f);
+
+    // MOTION IS DELIBERATELY NOT ZEROED HERE. A zero acceleration vector is not
+    // "neutral", it is free-fall: MotionInput::UpdateOrientation skips its drift
+    // correction entirely unless the acceleration length is within [0.75, 1.25]
+    // (motion_input.cpp:165), so writing {0,0,0} would leave the port's orientation
+    // estimate frozen and uncorrectable rather than at rest. Leaving the last real
+    // sample in place reads as a controller lying still, which is both truthful and
+    // harmless - and PollMotion() re-reads VirtualPortFor(0) every poll, so the new
+    // port starts receiving live samples immediately.
 }
 
 void RetroInput::Poll() {
@@ -263,6 +355,26 @@ void RetroInput::PollPad(unsigned retro_port) {
     const std::size_t virtual_port = VirtualPortFor(retro_port);
     auto& prev = prev_buttons[retro_port];
 
+    // Hand the binding over. See the header comment, defect 3.
+    //
+    // Both ports are driven to a known baseline, not just the one being left. The
+    // arriving port needs it too: prev is about to be cleared to all-false, and the
+    // delta loop below only writes a button when it DIFFERS from prev, so a button
+    // that is stale-true on the arriving port and not currently held would never be
+    // written false and would stay stuck down.
+    if (bound_port[retro_port] != virtual_port) {
+        if (bound_port[retro_port] != UnboundPort) {
+            LOG_INFO(Frontend, "libretro: port {} rebinding from virtual port {} to {}", retro_port,
+                     bound_port[retro_port], virtual_port);
+            ReleaseVirtualPort(bound_port[retro_port]);
+        }
+        ReleaseVirtualPort(virtual_port);
+        prev = {};
+        bound_port[retro_port] = virtual_port;
+        // Everything physically held is re-asserted by the loop below, this frame,
+        // because prev now disagrees with it.
+    }
+
     for (const auto& entry : kPadMap) {
         const bool pressed = state_cb(retro_port, RETRO_DEVICE_JOYPAD, 0, entry.retro_id) != 0;
         const auto index = static_cast<std::size_t>(entry.virtual_button);
@@ -282,6 +394,8 @@ void RetroInput::PollPad(unsigned retro_port) {
         return std::clamp(raw / 32767.0f, -1.0f, 1.0f);
     };
 
+    // Written unconditionally every poll, so the arriving port picks the sticks up on
+    // the same frame as the hand-over with no extra bookkeeping.
     // libretro's +Y is down; Eden's stick +Y is up.
     vgp->SetStickPosition(
         virtual_port, VS::Left, read_axis(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X),
@@ -304,27 +418,45 @@ void RetroInput::PollTouch() {
     // (touch_screen.h:43, :34, :46).
     touch->ClearActiveFlag();
 
-    const auto count =
-        static_cast<int>(state_cb(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_COUNT));
+    // THE POINTER-INDEX CONTRACT THE FRONTEND HAS TO MEET.
+    //
+    // TouchScreen keys a finger by the id it is given, and only ever reuses an
+    // internal slot for that same id (touch_screen.cpp:34-49, :63-74). So the id has to
+    // be STABLE for the life of one physical touch. libretro has no touch-id concept at
+    // all - RETRO_DEVICE_POINTER exposes only an index - which means the index IS the
+    // identity as far as this code can tell. A frontend that compacts its pointer list
+    // when a finger lifts (so the finger at index 1 becomes index 0) makes every
+    // remaining finger appear to teleport to another finger's position.
+    //
+    // The requirement on the frontend is therefore: an index is a SLOT, held for the
+    // life of the touch that took it, reporting PRESSED == 0 once that touch lifts.
+    // Holes are fine. This loop scans every slot rather than the first COUNT of them
+    // precisely so a frontend with holes works; COUNT is used only as the one thing it
+    // means under either reading - zero means nothing is down.
+    const auto reported =
+        state_cb(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_COUNT);
 
-    for (int i = 0; i < count && i < static_cast<int>(MaxTouchPoints); ++i) {
-        const auto idx = static_cast<unsigned>(i);
-        if (state_cb(0, RETRO_DEVICE_POINTER, idx, RETRO_DEVICE_ID_POINTER_PRESSED) == 0) {
-            continue;
-        }
-        const auto raw_x = state_cb(0, RETRO_DEVICE_POINTER, idx, RETRO_DEVICE_ID_POINTER_X);
-        const auto raw_y = state_cb(0, RETRO_DEVICE_POINTER, idx, RETRO_DEVICE_ID_POINTER_Y);
+    if (reported > 0) {
+        for (std::size_t slot = 0; slot < MaxTouchPoints; ++slot) {
+            const auto idx = static_cast<unsigned>(slot);
+            if (state_cb(0, RETRO_DEVICE_POINTER, idx, RETRO_DEVICE_ID_POINTER_PRESSED) == 0) {
+                continue;
+            }
+            const auto raw_x = state_cb(0, RETRO_DEVICE_POINTER, idx, RETRO_DEVICE_ID_POINTER_X);
+            const auto raw_y = state_cb(0, RETRO_DEVICE_POINTER, idx, RETRO_DEVICE_ID_POINTER_Y);
 
-        // libretro pointer space is [-0x7fff, 0x7fff] across the viewport, and
-        // TouchScreen::TouchMoved feeds x/y straight into SetAxis expecting [0, 1].
-        // EmuWindow::MapToTouchScreen is not needed - libretro already gave us
-        // viewport-relative coordinates.
-        const float x = (static_cast<float>(raw_x) + 32767.0f) / 65534.0f;
-        const float y = (static_cast<float>(raw_y) + 32767.0f) / 65534.0f;
-        if (x < 0.0f || x > 1.0f || y < 0.0f || y > 1.0f) {
-            continue; // outside the emulated screen
+            // libretro pointer space is [-0x7fff, 0x7fff] across the viewport, and
+            // TouchScreen::TouchMoved feeds x/y straight into SetAxis expecting [0, 1].
+            // EmuWindow::MapToTouchScreen is not needed - libretro already gave us
+            // viewport-relative coordinates.
+            const float x = (static_cast<float>(raw_x) + 32767.0f) / 65534.0f;
+            const float y = (static_cast<float>(raw_y) + 32767.0f) / 65534.0f;
+            if (x < 0.0f || x > 1.0f || y < 0.0f || y > 1.0f) {
+                continue; // outside the emulated screen
+            }
+            // slot + 1, never 0: see RetroInput::FingerIdBias, defect 4.
+            touch->TouchPressed(x, y, slot + FingerIdBias);
         }
-        touch->TouchPressed(x, y, static_cast<std::size_t>(i));
     }
 
     touch->ReleaseInactiveTouch();
@@ -350,15 +482,17 @@ void RetroInput::PollMotion() {
     }
     const auto delta = static_cast<u64>(delta_us);
 
-    const float gyro_x = sensors.get_sensor_input(0, RETRO_SENSOR_GYROSCOPE_X) * kRadPerSecToRevPerSec;
-    const float gyro_y = sensors.get_sensor_input(0, RETRO_SENSOR_GYROSCOPE_Y) * kRadPerSecToRevPerSec;
-    const float gyro_z = sensors.get_sensor_input(0, RETRO_SENSOR_GYROSCOPE_Z) * kRadPerSecToRevPerSec;
-    const float accel_x =
-        sensors.get_sensor_input(0, RETRO_SENSOR_ACCELEROMETER_X) * kMetresPerSecSqToG;
-    const float accel_y =
-        sensors.get_sensor_input(0, RETRO_SENSOR_ACCELEROMETER_Y) * kMetresPerSecSqToG;
-    const float accel_z =
-        sensors.get_sensor_input(0, RETRO_SENSOR_ACCELEROMETER_Z) * kMetresPerSecSqToG;
+    const auto read_gyro = [this](unsigned id) {
+        return sensors.get_sensor_input(0, id) * kRadPerSecToRevPerSec;
+    };
+    const auto read_accel = [this](unsigned id) { return sensors.get_sensor_input(0, id); };
+
+    const float gyro_x = read_gyro(RETRO_SENSOR_GYROSCOPE_X);
+    const float gyro_y = read_gyro(RETRO_SENSOR_GYROSCOPE_Y);
+    const float gyro_z = read_gyro(RETRO_SENSOR_GYROSCOPE_Z);
+    const float accel_x = read_accel(RETRO_SENSOR_ACCELEROMETER_X);
+    const float accel_y = read_accel(RETRO_SENSOR_ACCELEROMETER_Y);
+    const float accel_z = read_accel(RETRO_SENSOR_ACCELEROMETER_Z);
 
     // LoadVirtualGamepadParams maps both MotionLeft and MotionRight to motion:0
     // (emulated_controller.cpp:334-335), so one call drives both Joy-Cons.
@@ -372,10 +506,17 @@ void RetroInput::PollMotion() {
         vgp->SetMotionState(HandheldPort, delta, gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z);
     }
 
-    // TODO(input): axis orientation between the sensor frame and the Joy-Con frame is
-    // UNVERIFIED. The units above are read out of motion_input.h; no axis convention is
-    // documented anywhere in Eden's source. Expect to determine the sign and axis
-    // permutation empirically against a title with gyro aiming.
+    // TODO(input): the AXIS PERMUTATION AND SIGNS are still UNVERIFIED, and are now the
+    // only unverified part of this function - the units on both sides are pinned down
+    // above, with a citation each.
+    //
+    // What is known: libretro's frame is documented (libretro.h:4640-4698) as +X right,
+    // +Y up, +Z towards the user with the device viewed head-on, gravity included, so a
+    // device face-up at rest reads (0, 0, 1); gyro is angular velocity about those same
+    // local axes, positive counter-clockwise. Eden documents NO frame for the Joy-Con
+    // motion it feeds to MotionInput - grepping hid_core turns up no axis convention at
+    // all - so the permutation between the two cannot be derived from the source and
+    // has to be found empirically against a title with gyro aiming.
 }
 
 void RetroInput::OnGameUnloaded() {
@@ -394,6 +535,7 @@ void RetroInput::OnGameUnloaded() {
     // suyu never clears its button state on unload, so stale presses survive into the
     // next load. It also uses one shared array for all ports.
     prev_buttons = {};
+    bound_port.fill(UnboundPort);
     loaded = false;
     system = nullptr;
     input = nullptr;

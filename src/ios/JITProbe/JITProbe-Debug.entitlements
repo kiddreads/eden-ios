@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- DEBUG variant. A Debug build IS the debugger-attached case, which is the
+	     condition StikDebug manufactures on a release device. Identical to
+	     src/ios/Eden-Debug.entitlements. -->
+	<key>get-task-allow</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.disable-executable-page-protection</key>
+	<true/>
+</dict>
+</plist>

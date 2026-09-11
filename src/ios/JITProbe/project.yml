@@ -1,0 +1,126 @@
+# SPDX-FileCopyrightText: Copyright 2026 eden-ios contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# XcodeGen spec for the standalone JIT probe.
+#
+#   cd src/ios/JITProbe && xcodegen generate
+#   xcodebuild -project JITProbe.xcodeproj -scheme JITProbe -sdk iphoneos \
+#     -configuration Release CODE_SIGNING_ALLOWED=NO build
+#
+# ---------------------------------------------------------------------------
+# THIS TARGET DEPENDS ON NOTHING
+# ---------------------------------------------------------------------------
+# No CMake tree, no link-flags response file, no libeden_libretro.a, no MoltenVK, no
+# preBuildScript, no postBuildScript. Compare src/ios/project.yml, which needs all of
+# them - it links ~60 static archives and cannot be built until the core builds.
+#
+# That independence is the point. The question this app answers decides whether the
+# rest of the port is worth doing, so it must be answerable BEFORE the rest of the port
+# works. Two Swift files and one C file build on a clean runner in about a minute, and
+# the resulting IPA can go to a tester the same day.
+#
+# Keep it that way. If this ever grows a dependency on the core, it stops being a probe
+# and becomes another thing that has to build first.
+
+name: JITProbe
+
+options:
+  bundleIdPrefix: dev.edenios
+  deploymentTarget:
+    iOS: '15.0'
+  createIntermediateGroups: true
+
+configs:
+  Debug: debug
+  Release: release
+
+settings:
+  base:
+    PRODUCT_NAME: JITProbe
+    # A DIFFERENT bundle id from dev.edenios.Eden, on purpose. Same id would mean
+    # installing the probe replaces Eden and orphans its Documents container - the one
+    # holding the tester's prod.keys and firmware.
+    PRODUCT_BUNDLE_IDENTIFIER: dev.edenios.JITProbe
+    SDKROOT: iphoneos
+    IPHONEOS_DEPLOYMENT_TARGET: '15.0'
+    TARGETED_DEVICE_FAMILY: '1,2'
+
+    # arm64 ONLY, and not arm64e. Probe/jit_probe.c manufactures a function pointer to
+    # memory it wrote and calls it; on arm64e that pointer would need signing with
+    # pointer authentication, and an unsigned one faults for reasons that have nothing
+    # to do with JIT permission - which would make this app answer the wrong question
+    # convincingly. There is a comment on jp_enter_page saying the same thing; if ARCHS
+    # ever changes, both have to change together.
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: 'NO'
+    SUPPORTS_MACCATALYST: 'NO'
+
+    # A REAL Info.plist with generation OFF, for the reason recorded in
+    # src/ios/project.yml: xcodebuild's GENERATE_INFOPLIST_FILE + INFOPLIST_FILE merge
+    # silently DROPS UIFileSharingEnabled while keeping other keys. This app needs that
+    # key - the crash journal and the saved report are only reachable through Files.app.
+    GENERATE_INFOPLIST_FILE: 'NO'
+    INFOPLIST_FILE: Info.plist
+
+    SWIFT_OBJC_BRIDGING_HEADER: JITProbe-Bridging-Header.h
+    SWIFT_VERSION: '5.0'
+    CLANG_ENABLE_MODULES: 'YES'
+    # Probe/jit_probe.c is plain C with no Objective-C objects in it. ARC is on for the
+    # Swift side and simply does not apply to the C file.
+    CLANG_ENABLE_OBJC_ARC: 'YES'
+
+    HEADER_SEARCH_PATHS:
+      - '$(SRCROOT)/Probe'
+
+    MARKETING_VERSION: '0.1.0'
+    CURRENT_PROJECT_VERSION: '1'
+
+    # Symbols stay in the binary. A tester's crash report is the SECOND most useful
+    # output of this app after the on-screen verdict, and it cannot be symbolicated
+    # through TestFlight from a sideloaded build, so the symbols have to be present.
+    STRIP_INSTALLED_PRODUCT: 'NO'
+    COPY_PHASE_STRIP: 'NO'
+
+    # -O is fine and is used. jp_enter_page() and jp_protected_write() are written so
+    # that optimisation cannot break them: everything read after a siglongjmp lives in
+    # file-scope volatile storage rather than in locals, which is the rule the C
+    # standard actually imposes.
+
+  configs:
+    Debug:
+      CODE_SIGN_ENTITLEMENTS: JITProbe-Debug.entitlements
+      SWIFT_OPTIMIZATION_LEVEL: '-Onone'
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+      GCC_PREPROCESSOR_DEFINITIONS: 'DEBUG=1 $(inherited)'
+    Release:
+      CODE_SIGN_ENTITLEMENTS: JITProbe.entitlements
+      SWIFT_OPTIMIZATION_LEVEL: '-O'
+      DEAD_CODE_STRIPPING: 'YES'
+
+targets:
+  JITProbe:
+    type: application
+    platform: iOS
+    deploymentTarget: '15.0'
+
+    sources:
+      - path: App
+        type: group
+      - path: Probe
+        type: group
+
+    dependencies:
+      - sdk: UIKit.framework
+      - sdk: Foundation.framework
+      - sdk: SwiftUI.framework
+      # CoreFoundation for CFStringRef/CFBooleanRef in the SecTask query, and Security
+      # so that dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement") has an image to
+      # find the symbol in. SecTask.h is not in the public iOS SDK, which is why the
+      # two functions are resolved by name rather than called directly - but the
+      # framework still has to be LOADED, and linking it is what loads it.
+      - sdk: CoreFoundation.framework
+      - sdk: Security.framework
+
+    scheme:
+      gatherCoverageData: false
+      testTargets: []

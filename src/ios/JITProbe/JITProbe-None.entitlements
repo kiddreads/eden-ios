@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- THE CONTROL. Signed, but asking for nothing.
+
+	     This variant exists so the experiment has one. If the sideload variant passes,
+	     the obvious next question is whether it passed BECAUSE of its entitlements or
+	     whether this device would have allowed it anyway - and without a
+	     no-entitlements build there is no way to tell. A pass here and a pass there
+	     means the entitlements are not what is doing the work; a fail here and a pass
+	     there means they are.
+
+	     Eden's own entitlements files have no equivalent, because Eden is not an
+	     experiment. This one is. -->
+</dict>
+</plist>

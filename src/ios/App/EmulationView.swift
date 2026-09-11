@@ -86,7 +86,9 @@ struct MetalSurface: UIViewRepresentable {
         let container = UIView()
         container.backgroundColor = .black
 
-        let surface = EdenMetalLayerView.sharedView
+        // Swift's ObjC importer strips the type-name suffix from +sharedView, so the
+        // class property is spelled `shared` here. Same object either way.
+        let surface = EdenMetalLayerView.shared
         surface.removeFromSuperview()
         surface.translatesAutoresizingMaskIntoConstraints = false
         // Touches reach the guest touchscreen only while this view is on screen.
@@ -107,7 +109,7 @@ struct MetalSurface: UIViewRepresentable {
     static func dismantleUIView(_ view: UIView, coordinator: ()) {
         // Stop forwarding, but do NOT tear the view down or detach the layer: the core
         // may still be presenting into it while teardown runs.
-        EdenMetalLayerView.sharedView.forwardsTouchesToGuest = false
+        EdenMetalLayerView.shared.forwardsTouchesToGuest = false
     }
 }
 

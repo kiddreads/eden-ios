@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- SIDELOAD variant. The default, and the one to install first.
+
+	     Matches src/ios/Eden.entitlements exactly, minus the two memory-limit keys
+	     which have nothing to do with JIT and only give a free-account re-sign more to
+	     object to. Matching matters: the probe's answer is only transferable to Eden if
+	     the probe was signed the way Eden is signed. A probe that passed with a
+	     different entitlement set would prove nothing about Eden.
+
+	     get-task-allow is the load-bearing key. It is what permits a debugger to attach
+	     at all, and being debugged is what sets CS_DEBUGGED, which is one of the two
+	     things docs/IOS_PORT_NOTES.md names as granting executable memory on iOS.
+
+	     dynamic-codesigning is deliberately NOT here - it is restricted, and including
+	     it in the variant meant for free-account re-signing can make the re-sign itself
+	     fail. It is in JITProbe-TrollStore.entitlements. -->
+	<key>get-task-allow</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.disable-executable-page-protection</key>
+	<true/>
+</dict>
+</plist>
