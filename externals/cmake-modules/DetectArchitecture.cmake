@@ -40,8 +40,17 @@ if (CMAKE_OSX_ARCHITECTURES)
     set(ARCHITECTURE "${CMAKE_OSX_ARCHITECTURES}")
 
     # hope and pray the architecture names match
-    foreach(ARCH IN ${CMAKE_OSX_ARCHITECTURES})
-        set(ARCHITECTURE_${ARCH} 1 PARENT_SCOPE)
+    #
+    # `foreach(x IN <list>)` is not valid CMake - `IN` must be followed by LISTS or
+    # ITEMS - so this errored out for anyone who actually set CMAKE_OSX_ARCHITECTURES.
+    # Desktop macOS builds usually leave it unset and skip this branch entirely, which
+    # is why it went unnoticed; an iOS toolchain has to set it.
+    #
+    # PARENT_SCOPE is also dropped: this file is include()d, and include() does not
+    # create a new scope, so the variable was being set somewhere the caller could not
+    # see it (and CMake warns about it at top level).
+    foreach(ARCH IN LISTS CMAKE_OSX_ARCHITECTURES)
+        set(ARCHITECTURE_${ARCH} 1)
         add_definitions(-DARCHITECTURE_${ARCH}=1)
     endforeach()
 
