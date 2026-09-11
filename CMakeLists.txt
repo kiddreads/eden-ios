@@ -514,7 +514,16 @@ endfunction()
 # Put these BEFORE EXTERNALS or Boost WILL die
 # =============================================
 
-if (APPLE)
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # iOS is APPLE too, but it is not macOS: Carbon and Cocoa do not exist in the
+    # iPhoneOS SDK (UIKit replaces Cocoa, and Carbon has no iOS equivalent at all),
+    # and IOKit is not a public framework there. Requiring them made configure fail
+    # outright with "Could not find Carbon_LIBRARY".
+    foreach(fw Metal CoreVideo CoreMedia Security UniformTypeIdentifiers Foundation UIKit)
+        find_library(${fw}_LIBRARY ${fw} REQUIRED)
+        list(APPEND PLATFORM_LIBRARIES ${${fw}_LIBRARY})
+    endforeach()
+elseif (APPLE)
     foreach(fw Carbon Metal Cocoa IOKit CoreVideo CoreMedia Security UniformTypeIdentifiers Foundation)
         find_library(${fw}_LIBRARY ${fw} REQUIRED)
         list(APPEND PLATFORM_LIBRARIES ${${fw}_LIBRARY})
