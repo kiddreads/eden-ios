@@ -19,7 +19,7 @@ under a gigabyte of free disk, so there is no local build and there never will b
 | Milestone | Gate | State |
 |---|---|---|
 | M0 | Eden's source mirrored into this repo, CI in place | **met** |
-| M1 | Eden's core libraries cross-compile for `iphoneos` arm64 | **partly met** — 4 of 10 targets |
+| M1 | Eden's core libraries cross-compile for `iphoneos` arm64 | **met** — all 10 targets, JIT verified present |
 | M2 | A libretro core links for iOS | not started |
 | M3 | An installable artifact launches on a real device | not started |
 | M4 | A homebrew `.nro` boots and something it draws reaches the screen | not started |
@@ -28,23 +28,29 @@ under a gigabyte of free disk, so there is no local build and there never will b
 
 ### M1 detail — what compiles for iphoneos arm64
 
-CMake configure is **clean**. These targets build:
+CMake configure is clean and **all ten core targets build**:
 
-| Target | State |
-|---|---|
-| `common` | builds |
-| `dynarmic` | builds — this is the ARM64 JIT |
-| `network` | builds |
-| `shader_recompiler` | builds |
-| `core` | blocked |
-| `hid_core` | blocked |
-| `audio_core` | blocked |
-| `video_core` | blocked |
-| `input_common` | blocked |
-| `frontend_common` | blocked |
+`dynarmic` · `common` · `core` · `hid_core` · `audio_core` · `shader_recompiler` ·
+`video_core` · `network` · `input_common` · `frontend_common`
 
-All six blocked targets fail for a single shared reason — Boost.Process not compiling — not for
-six different reasons. See the commit history.
+"It compiled" is not the claim, though, so CI also inspects the archive:
+
+```
+archive: build/src/dynarmic/src/dynarmic/libdynarmic.a (4.7M)
+objects: 68
+symbols matching Arm64: 2003
+symbols matching A64:   779
+```
+
+That check exists because it was needed. An earlier run reported `dynarmic | BUILT` for an
+archive containing **no backend at all**: an iOS toolchain must set `CMAKE_OSX_ARCHITECTURES`,
+which made `DetectArchitecture.cmake` declare a single-architecture build "multiarch", which
+routed every arm64 source through a wrapper emitting `#if defined(ARCHITECTURE_ARM64)` while
+the build defined `ARCHITECTURE_arm64`. Every backend file compiled to an empty translation
+unit and linked cleanly. A green build of an empty archive is worse than a red one.
+
+**What this does not mean.** The core compiles. Nothing has run, nothing has been linked into
+an app, and no device has seen it.
 
 ## What has actually been fixed, and why it mattered
 
