@@ -1,0 +1,116 @@
+name: Mirror Eden upstream
+
+# Eden lives on a Forgejo instance (git.eden-emu.dev), not GitHub, so GitHub Actions
+# cannot see it directly. This job clones it on a runner and pushes it into this repo
+# as the `upstream` branch, which the iOS port is then built on top of.
+#
+# It runs on a runner rather than on the maintainer's machine on purpose: that machine
+# has a few hundred megabytes of free disk, and a full Eden clone does not fit on it.
+#
+# Result: `upstream` always tracks Eden as-published; `main` carries the iOS port and
+# merges `upstream` when we want to rebase onto newer Eden.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Upstream branch or tag to mirror (default: the repo default branch)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays, so the port does not silently drift a year behind
+
+permissions:
+  contents: write   # the default GITHUB_TOKEN cannot push without this
+
+concurrency:
+  group: mirror-upstream
+  cancel-in-progress: false
+
+env:
+  PRIMARY: https://git.eden-emu.dev/eden-emu/eden.git
+  FALLBACK: https://github.com/kongmao4567890-glitch/eden.git
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Disk before
+        run: df -h / | tail -1
+
+      # Git LFS pointers whose objects 404 upstream will abort a checkout outright.
+      # skip-smudge keeps the pointer files and lets the clone finish; nothing in the
+      # build needs the smudged content at mirror time.
+      - name: Configure git
+        run: |
+          git lfs install --skip-smudge || true
+          git config --global init.defaultBranch main
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Clone Eden
+        id: clone
+        run: |
+          set -u
+          REF_ARG=""
+          if [ -n "${{ github.event.inputs.ref }}" ]; then
+            REF_ARG="--branch ${{ github.event.inputs.ref }}"
+          fi
+          if git clone $REF_ARG "$PRIMARY" eden; then
+            SRC="$PRIMARY"
+          else
+            echo "::warning::Forgejo clone failed, falling back to the GitHub mirror (may lag upstream)"
+            rm -rf eden
+            git clone $REF_ARG "$FALLBACK" eden
+            SRC="$FALLBACK"
+          fi
+          echo "source=$SRC" >> "$GITHUB_OUTPUT"
+          cd eden
+          echo "--- mirrored ---"
+          echo "source:  $SRC"
+          echo "HEAD:    $(git rev-parse HEAD)"
+          echo "branch:  $(git rev-parse --abbrev-ref HEAD)"
+          echo "commits: $(git rev-list --count HEAD)"
+          echo "subject: $(git log -1 --pretty=%s)"
+          echo "date:    $(git log -1 --pretty=%ci)"
+          du -sh .git
+
+      - name: Sanity-check it is actually Eden
+        run: |
+          cd eden
+          test -f CMakeLists.txt   || { echo "::error::no CMakeLists.txt - not an Eden tree"; exit 1; }
+          test -d src/core         || { echo "::error::no src/core"; exit 1; }
+          test -d src/video_core   || { echo "::error::no src/video_core"; exit 1; }
+          test -d src/dynarmic     || { echo "::error::no src/dynarmic - the ARM64 JIT must be in-tree"; exit 1; }
+          echo "src/ contents:"; ls src
+
+      - name: Push to this repo as `upstream`
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd eden
+          git remote add ours "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git push ours "HEAD:refs/heads/upstream" --force
+          git push ours --tags --force || echo "::warning::tag push failed (non-fatal)"
+          echo "pushed $(git rev-parse HEAD) to refs/heads/upstream"
+
+      - name: Disk after
+        if: always()
+        run: df -h / | tail -1
+
+      - name: Summary
+        run: |
+          cd eden
+          {
+            echo "### Eden upstream mirrored"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| source | \`${{ steps.clone.outputs.source }}\` |"
+            echo "| commit | \`$(git rev-parse HEAD)\` |"
+            echo "| subject | $(git log -1 --pretty=%s) |"
+            echo "| date | $(git log -1 --pretty=%ci) |"
+            echo "| commits | $(git rev-list --count HEAD) |"
+          } >> "$GITHUB_STEP_SUMMARY"
