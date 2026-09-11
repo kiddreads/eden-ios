@@ -325,6 +325,18 @@ endif()
 
 if (WIN32)
     target_sources(dynarmic PRIVATE backend/exception_handler_windows.cpp)
+elseif (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # iOS is APPLE, but the macOS branch below is wrong for it in three ways: mach_exc.defs
+    # is not shipped in the iPhoneOS SDK, the mig invocations hardcode -arch x86_64, and
+    # Mach exception ports are restricted on iOS regardless. It currently avoids all of that
+    # only because find_path fails to locate a macOS-only file, which is accidental rather
+    # than intentional - a stray include path would silently turn it back on.
+    #
+    # The generic handler is the right answer here: its SupportsFastmem() returns false, and
+    # fastmem is unavailable on iOS anyway because host pages are 16 KiB against a 4 KiB
+    # guest (see common/host_memory.cpp).
+    message(STATUS "iOS: using the generic exception handler; fastmem is unavailable")
+    target_sources(dynarmic PRIVATE backend/exception_handler_generic.cpp)
 elseif (APPLE)
     find_path(MACH_EXC_DEFS_DIR "mach/mach_exc.defs")
     if (NOT MACH_EXC_DEFS_DIR)
