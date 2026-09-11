@@ -1,0 +1,330 @@
+name: Build iOS App
+
+# M2 gate: does an installable IPA come out the other end?
+#
+# build-ios-core.yml answers "does the emulator core cross-compile for iphoneos arm64".
+# This job answers the next question: can an app be built around it, linked, packaged
+# and verified - with no local Xcode, because the machine driving this port has none
+# and under a gigabyte of free disk. That is a permanent constraint, not a temporary one.
+#
+# Flow:
+#   install tools -> restore the SAME CPM cache entry as build-ios-core.yml
+#   -> configure with that workflow's flag list -> build the core targets
+#   -> re-run the libdynarmic Arm64-symbol check -> fetch device-arm64 MoltenVK
+#   -> xcodegen generate -> xcodebuild CODE_SIGNING_ALLOWED=NO
+#   -> pack three IPAs (ad-hoc re-sign of the ONE .app) -> gate all three through
+#      ci/verify-ipa.sh BEFORE any upload.
+#
+# WHAT THIS JOB DOES NOT CLAIM. It does not run a game. It does not prove JIT works on
+# a device - nothing in CI can, because JIT depends on how the IPA is re-signed and
+# installed. A green run here means the project generates, the target links, and the
+# bundle is well-formed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'ci/**'
+      - 'externals/**'
+      - 'CMakeLists.txt'
+      - 'CMakeModules/**'
+      - 'cpmfile.json'
+      - '.github/workflows/build-ios-app.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-ios-app-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The contract with src/ios/project.yml. If any of these change there, change them
+  # here - these are the only places they appear.
+  XCODE_PROJECT: Eden-iOS.xcodeproj
+  SCHEME: Eden
+  APP_NAME: Eden
+  BUILD_DIR: build-ios
+
+jobs:
+  app:
+    runs-on: macos-15
+    # build-ios-core.yml allows 180. This job does strictly more: the same core build,
+    # plus xcodegen, plus a link of ~60 static archives, plus three package-and-verify
+    # rounds.
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Environment
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          sw_vers
+          df -h / | tail -1
+
+      - name: Install build tools
+        run: |
+          brew update --quiet || true
+          brew install cmake ninja glslang ccache xcodegen \
+            || brew upgrade cmake ninja glslang ccache xcodegen || true
+          cmake --version
+          xcodegen --version
+          echo "glslangValidator: $(command -v glslangValidator || echo MISSING)"
+
+      # Byte-identical key and restore-keys to build-ios-core.yml, on purpose.
+      #
+      # CMakeLists.txt:13 sets CPM_SOURCE_CACHE to ${CMAKE_SOURCE_DIR}/.cache/cpm and
+      # CMakeModules/CPMUtil.cmake defaults to the same repo-relative path, so both
+      # workflows' CPM downloads land in ONE directory whatever the build dir is called
+      # (build vs build-ios). Whichever workflow runs first writes the entry, the other
+      # hits it. Actions caches are immutable, so the second save is a no-op ("Cache
+      # already exists"), not a duplicate 1-2 GB entry.
+      #
+      # Caveat worth knowing: a cache written on a branch is visible only to that branch
+      # and its children; one written on the default branch is visible everywhere. So
+      # the first main run populates the shared entry and a PR run reads main's copy
+      # while saving its own PR-scoped one.
+      #
+      # This caches the CPM download+extract only. Zero object files.
+      - name: Cache CPM sources
+        uses: actions/cache@v4
+        with:
+          path: .cache/cpm
+          key: cpm-ios-${{ hashFiles('cpmfile.json', 'CMakeModules/CPMUtil.cmake') }}
+          restore-keys: cpm-ios-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-ios-app-${{ github.sha }}
+          restore-keys: |
+            ccache-ios-app-
+            ccache-ios-
+
+      - name: Prime ccache
+        run: |
+          ccache --max-size=3G
+          ccache --zero-stats
+
+      # Flag list matches build-ios-core.yml's. Divergence between the two configure
+      # lines is how "it built in the core job" stops meaning anything here.
+      - name: Configure
+        run: |
+          set -o pipefail
+          cmake -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/CMakeModules/toolchains/iOS.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_QT=OFF \
+            -DENABLE_QT_TRANSLATION=OFF \
+            -DYUZU_CMD=OFF \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DENABLE_CUBEB=OFF \
+            -DENABLE_LIBUSB=OFF \
+            -DENABLE_WEB_SERVICE=OFF \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DENABLE_WIFI_SCAN=OFF \
+            -DYUZU_TESTS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DENABLE_LIBRETRO=ON \
+            -DUSE_CCACHE=ON \
+            -DYUZU_DISABLE_LLVM=ON \
+            -DYUZU_USE_BUNDLED_FFMPEG=ON \
+            -DYUZU_USE_BUNDLED_SIRIT=ON \
+            -DYUZU_DOWNLOAD_TIME_ZONE_DATA=ON \
+            -DYUZU_DOWNLOAD_ANDROID_VVL=OFF \
+            2>&1 | tee configure.log
+
+      # eden_libretro last: it links core, video_core, hid_core, input_common, common
+      # and network (src/libretro_core/CMakeLists.txt), so it cannot be green before
+      # they are, and building it last keeps a failure pointing at the real first cause.
+      - name: Build the core
+        run: |
+          set -u -o pipefail
+          cmake --build "$BUILD_DIR" --target eden_libretro -j"$(sysctl -n hw.ncpu)" \
+            2>&1 | tee build-core.log
+
+      # The same gate build-ios-core.yml runs, and for the same reason it exists there:
+      # "every backend/arm64 source was being wrapped in #if defined(ARCHITECTURE_ARM64)
+      # while the build defined ARCHITECTURE_arm64, so libdynarmic.a built green with no
+      # JIT backend in it." Without a JIT there is no emulation at all, so this is worth
+      # re-checking on the artifact this job actually ships.
+      - name: Check libdynarmic.a contains the arm64 backend
+        run: |
+          set -u
+          LIB=$(find "$BUILD_DIR" -name 'libdynarmic.a' | head -1)
+          if [ -z "$LIB" ]; then echo "::error::libdynarmic.a was never produced"; exit 1; fi
+          SYMS=$(nm -g "$LIB" 2>/dev/null | grep -c "Arm64" || true)
+          echo "libdynarmic.a: $(du -h "$LIB" | cut -f1), Arm64 symbols: $SYMS"
+          if [ "$SYMS" -lt 1 ]; then
+            echo "::error::libdynarmic.a contains no Arm64 backend symbols"; exit 1
+          fi
+
+      # Non-fatal by design: nothing in the iOS link references a vk* symbol
+      # (MOLTENVK_LIBRARY is consumed only by src/yuzu, ENABLE_QT=OFF), so a missing
+      # MoltenVK does not stop the app from building. It stops it from rendering on a
+      # device, which verify-ipa.sh reports as a warning.
+      - name: Fetch MoltenVK (iphoneos arm64)
+        continue-on-error: true
+        run: |
+          ./ci/fetch-moltenvk.sh 2>&1 | tee moltenvk.log
+
+      - name: Generate the Xcode project
+        working-directory: src/ios
+        run: |
+          xcodegen generate
+          ls -la "$XCODE_PROJECT"
+
+      # -derivedDataPath explicitly, so the product path is deterministic. Hunting for
+      # it with `find ~/Library/Developer/Xcode/DerivedData | head -n1` picks up stale
+      # builds from earlier steps and is the classic way a workflow ships last run's
+      # binary.
+      #
+      # CODE_SIGNING_ALLOWED=NO: there is no certificate on a runner. Entitlements are
+      # applied afterwards by the three ad-hoc re-signs, which is why one .app can
+      # become three IPAs without linking ~60 archives three times.
+      - name: Build the app
+        working-directory: src/ios
+        run: |
+          set -o pipefail
+          EDEN_BUILD_DIR="$GITHUB_WORKSPACE/$BUILD_DIR" \
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            -scheme "$SCHEME" \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath "$GITHUB_WORKSPACE/derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee "$GITHUB_WORKSPACE/xcodebuild.log"
+
+      - name: Locate the product
+        id: product
+        run: |
+          APP="$GITHUB_WORKSPACE/derived/Build/Products/Release-iphoneos/$APP_NAME.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::no $APP_NAME.app at $APP"
+            find "$GITHUB_WORKSPACE/derived/Build/Products" -maxdepth 3 -name '*.app' || true
+            exit 1
+          fi
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "built: $APP"
+          ls -la "$APP"
+
+      # Three IPAs from one .app. cemu-ios-muffin's workflow does the same
+      # (".github/workflows/build-ios-app.yml": Package ad-hoc signed IPA), and the
+      # reason to prefer this over three Xcode targets is that the variants differ ONLY
+      # in their entitlements - three targets would mean linking ~60 archives three times.
+      # If a variant ever has to differ in more than entitlements, revisit that.
+      - name: Package three IPAs
+        run: |
+          set -euo pipefail
+          APP="${{ steps.product.outputs.app }}"
+
+          package() {
+            VARIANT="$1"
+            ENTS="$2"
+            OUT="$GITHUB_WORKSPACE/$APP_NAME-$VARIANT.ipa"
+
+            rm -rf "$GITHUB_WORKSPACE/stage-$VARIANT"
+            mkdir -p "$GITHUB_WORKSPACE/stage-$VARIANT/Payload"
+            cp -R "$APP" "$GITHUB_WORKSPACE/stage-$VARIANT/Payload/"
+            STAGED="$GITHUB_WORKSPACE/stage-$VARIANT/Payload/$APP_NAME.app"
+
+            if [ -n "$ENTS" ]; then
+              # NESTED CODE FIRST. codesign does not sign nested code automatically, and
+              # a bundle whose embedded dylib is unsigned has an invalid signature and
+              # will not launch.
+              for dylib in "$STAGED/Frameworks/"*.dylib; do
+                [ -f "$dylib" ] || continue
+                codesign --force --sign - --timestamp=none "$dylib"
+              done
+
+              # --generate-entitlement-der is MANDATORY on iOS 15+. A signature carrying
+              # only the XML blob is read as declaring no entitlements, while codesign
+              # still prints the XML back when asked - so the readback below cannot be
+              # trusted on its own, which is why ci/verify-ipa.sh also looks for the DER
+              # form.
+              codesign --force --sign - \
+                --entitlements "$GITHUB_WORKSPACE/src/ios/$ENTS" \
+                --generate-entitlement-der \
+                --timestamp=none \
+                "$STAGED"
+
+              echo "--- entitlements read back from $VARIANT ---"
+              codesign -d --entitlements :- --xml "$STAGED" 2>/dev/null | head -40 || true
+            fi
+
+            ( cd "$GITHUB_WORKSPACE/stage-$VARIANT" && zip -qry "$OUT" Payload )
+            echo "packed $OUT ($(du -h "$OUT" | cut -f1))"
+          }
+
+          # Unsigned: what the runner actually produced, for anyone who re-signs it
+          # themselves with their own tooling.
+          package "unsigned"   ""
+          package "sideload"   "Eden.entitlements"
+          package "trollstore" "Eden-TrollStore.entitlements"
+          package "debug"      "Eden-Debug.entitlements"
+
+      # BEFORE any upload. A gate that runs after the artifact is published is not a gate.
+      - name: Verify every IPA
+        run: |
+          set -euo pipefail
+          chmod +x ci/verify-ipa.sh
+          ./ci/verify-ipa.sh "$APP_NAME-unsigned.ipa"
+          ./ci/verify-ipa.sh "$APP_NAME-sideload.ipa"   src/ios/Eden.entitlements
+          ./ci/verify-ipa.sh "$APP_NAME-trollstore.ipa" src/ios/Eden-TrollStore.entitlements
+          ./ci/verify-ipa.sh "$APP_NAME-debug.ipa"      src/ios/Eden-Debug.entitlements
+
+      - name: Upload IPAs
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-ios-ipas
+          path: '*.ipa'
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-ios-app-logs
+          path: |
+            configure.log
+            build-core.log
+            moltenvk.log
+            xcodebuild.log
+            src/ios/link-flags.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## iOS app build (M2)"
+            echo ""
+            echo "Target: \`iphoneos\` arm64, deployment target 15.0, iPhone + iPad."
+            echo ""
+            if [ -f src/ios/link-flags.txt ]; then
+              echo "Linked **$(grep -c '\.a$' src/ios/link-flags.txt || echo 0)** static archives."
+            fi
+            echo ""
+            echo "### What a green run here does and does not mean"
+            echo "It means the Xcode project generates, the app target links against the"
+            echo "CMake-built core, and the bundles are well-formed."
+            echo ""
+            echo "It does **not** mean a game runs. JIT cannot be tested in CI - it depends"
+            echo "on how the IPA is re-signed and installed. And per"
+            echo "\`docs/IOS_PORT_NOTES.md\`, without JIT there is no emulation at all."
+          } >> "$GITHUB_STEP_SUMMARY"

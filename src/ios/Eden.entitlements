@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- DEFAULT / SIDELOAD variant. Release configuration.
+
+	     For SideStore / AltStore / StikDebug style installation, where the app is
+	     re-signed with a free developer certificate and JIT is granted by a debugger
+	     attaching at launch (which sets CS_DEBUGGED).
+
+	     docs/IOS_PORT_NOTES.md is explicit about what actually grants executable
+	     memory: "On iOS there is exactly one mechanism, not two. oaknut::CodeBlock maps
+	     plain anonymous memory and toggles it between RX and RW with mprotect. That
+	     requires the process to be allowed to do it: dynamic-codesigning (TrollStore),
+	     or being debugged, which sets CS_DEBUGGED (StikDebug)."
+
+	     get-task-allow is therefore the load-bearing key in THIS file - it is what
+	     permits a debugger to attach at all. The two cs.* keys are declarations of
+	     intent that cost nothing and are the correct thing for a JIT-using app to say;
+	     they are NOT a confirmed fix. cemu-ios-muffin/src/ios/Cemu.entitlements records
+	     the same open question and observed MAP_JIT still failing with errno 22 while
+	     CS_DEBUGGED was set, on a differently-signed binary.
+
+	     dynamic-codesigning is deliberately NOT here. It is a restricted entitlement;
+	     including it in the variant meant for free-account re-signing can make the
+	     re-sign itself fail. It lives in Eden-TrollStore.entitlements. -->
+	<key>get-task-allow</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.disable-executable-page-protection</key>
+	<true/>
+
+	<!-- docs/IOS_PORT_NOTES.md, Memory: "The Switch gives games ~3.2 GB. Builds need
+	     com.apple.developer.kernel.increased-memory-limit, and
+	     com.apple.developer.kernel.extended-virtual-addressing on some devices."
+
+	     UNVERIFIED: whether increased-memory-limit survives a SideStore/AltStore
+	     free-account re-sign. cemu-ios-muffin/docs/MUFFIN_WORK_BACKLOG.md item 87
+	     records the same open question. If a re-sign strips it, the symptom is a jetsam
+	     kill partway into a large title, not a launch failure. -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+</dict>
+</plist>

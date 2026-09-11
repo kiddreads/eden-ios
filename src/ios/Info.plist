@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- A REAL Info.plist, referenced by project.yml with GENERATE_INFOPLIST_FILE: NO.
+
+	     cemu-ios-muffin's project.yml records, verified against a built IPA, that
+	     xcodebuild's GENERATE_INFOPLIST_FILE + INFOPLIST_FILE merge silently drops
+	     UIFileSharingEnabled while keeping LSSupportsOpeningDocumentsInPlace - even
+	     though both keys land identically in the generated pbxproj. Both are mandatory
+	     for this app (keys and firmware arrive through Files.app), so the merge is
+	     avoided entirely rather than worked around. -->
+
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Eden</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+
+	<!-- docs/IOS_PORT_NOTES.md: "Deployment target iOS 15. iPhone AND iPad."
+	     1 = iPhone/iPod touch, 2 = iPad. ci/verify-ipa.sh asserts both are present. -->
+	<key>MinimumOSVersion</key>
+	<string>15.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+		<integer>2</integer>
+	</array>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+		<!-- MoltenVK renders through Metal; a device without it cannot run this at
+		     all. metal is the correct capability string (not "metal3" - the port
+		     targets A-series and M-series equally per IOS_PORT_NOTES.md). -->
+		<string>metal</string>
+	</array>
+
+	<!-- ===== THE TWO KEYS THE WHOLE SETUP FLOW DEPENDS ON =====
+	     Without UIFileSharingEnabled the app's Documents directory does not appear in
+	     Files.app at all, so there is no way to deliver prod.keys or firmware to a
+	     sideloaded build. LSSupportsOpeningDocumentsInPlace additionally lets the user
+	     keep a multi-GB XCI outside the container and open it in place, which matters
+	     because copying one in doubles the storage cost.
+	     docs/IOS_PORT_NOTES.md #2: the data root must be "a directory inside the app
+	     container that is visible to Files.app". This is what makes it visible. -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+
+	<!-- retro_get_system_info advertises "nsp|xci|nca|nro|nso|kip"
+	     (src/libretro_core/retro_core.cpp:348, itself derived from
+	     Loader::GuessFromFilename). None of these have a system UTI, so they are
+	     declared as exported types owned by this app; without a declaration the
+	     document picker cannot be asked to filter for them and shows everything.
+	     Conforms to public.data only - these are not archives, and block_extract is
+	     set true in retro_get_system_info precisely so no frontend tries to unzip a
+	     multi-GB XCI inside an iOS container. -->
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>dev.edenios.switch-rom</string>
+			<key>UTTypeDescription</key>
+			<string>Nintendo Switch Content</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>nsp</string>
+					<string>xci</string>
+					<string>nca</string>
+					<string>nro</string>
+					<string>nso</string>
+					<string>kip</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>dev.edenios.keys</string>
+			<key>UTTypeDescription</key>
+			<string>Switch Decryption Keys</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.plain-text</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>keys</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+
+	<!-- Both orientations on both idioms. Nothing in this port pins orientation;
+	     MetalSurfaceView recomputes drawableSize in layoutSubviews and calls
+	     eden_libretro_resize, so rotation is handled rather than prevented. -->
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+
+	<!-- An empty dict is the documented minimum and yields a plain system-background
+	     launch screen. UNVERIFIED: this has not been through xcodebuild. If it objects,
+	     the usual fix is adding a UIColorName or UIImageName key. -->
+	<key>UILaunchScreen</key>
+	<dict/>
+
+	<!-- SwiftUI's App lifecycle is scene-based. Declaring the manifest explicitly (as
+	     opposed to INFOPLIST_KEY_UIApplicationSceneManifest_Generation) keeps it in the
+	     one file that actually ships. UIApplicationSupportsMultipleScenes is false:
+	     there is exactly one CAMetalLayer and exactly one Core::System, and a second
+	     scene would hand the core a layer it does not own. -->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+	</dict>
+
+	<key>UIStatusBarHidden</key>
+	<true/>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<false/>
+	<!-- The emulation screen must not sleep while a game is running; the app also sets
+	     isIdleTimerDisabled at runtime. This key alone is not sufficient, it just keeps
+	     the default sane. -->
+	<key>UIRequiresFullScreen</key>
+	<false/>
+
+	<!-- CoreMotion is in the framework list because SDL3's iOS backend references it.
+	     The sensor path (RETRO_ENVIRONMENT_GET_SENSOR_INTERFACE) is NOT implemented in
+	     cut one - the bridge answers that command false and retro_input.cpp's
+	     SetEnvironment leaves sensors_available false, which it handles. This string is
+	     present so that wiring it up later does not also require a plist change and a
+	     new review. I believe raw CMMotionManager accelerometer/gyro updates need no
+	     authorisation prompt on iOS 15 (that is CMMotionActivityManager), but I did not
+	     verify it. -->
+	<key>NSMotionUsageDescription</key>
+	<string>Eden uses motion data for games that read the console gyroscope.</string>
+
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+</dict>
+</plist>

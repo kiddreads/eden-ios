@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- TROLLSTORE variant.
+
+	     TrollStore installs an app with a permanently valid signature and can grant
+	     entitlements that no App Store or free-developer signature may carry. On the
+	     iOS versions where it works, this is the variant that gets JIT without a
+	     debugger attached at every launch.
+
+	     dynamic-codesigning is THE key here. docs/IOS_PORT_NOTES.md: oaknut::CodeBlock
+	     "maps plain anonymous memory and toggles it between RX and RW with mprotect.
+	     That requires the process to be allowed to do it: dynamic-codesigning
+	     (TrollStore), or being debugged, which sets CS_DEBUGGED (StikDebug)."
+	     Without it, mprotect(PROT_READ|PROT_EXEC) is refused and there is no
+	     emulation at all - not slow emulation, none. HAS_NCE is gated on
+	     ARCHITECTURE_arm64 AND (ANDROID OR LINUX), so there is no interpreter to
+	     fall back to.
+
+	     File naming: this is Eden-TrollStore.entitlements, capital S. macOS filesystems
+	     are case-insensitive by default, so a sibling named Eden-trollstore.entitlements
+	     is the SAME FILE and one silently overwrites the other. One spelling only.
+
+	     No iOS version numbers appear here or in the app's user-facing copy: TrollStore
+	     and StikDebug support ranges move, and a hardcoded number becomes a lie. The
+	     app tells the user to check the tool's own README. -->
+	<key>dynamic-codesigning</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.disable-executable-page-protection</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+
+	<!-- get-task-allow is present so that a debugger can still attach to a TrollStore
+	     build for diagnosis. It is not required for JIT in this variant -
+	     dynamic-codesigning covers that on its own. -->
+	<key>get-task-allow</key>
+	<true/>
+
+	<!-- The Switch gives games ~3.2 GB (docs/IOS_PORT_NOTES.md, Memory). A TrollStore
+	     signature can carry these without a provisioning profile, which is the main
+	     practical reason to prefer this variant on a device where it is available. -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+
+	<!-- Unmeasured, and stated as such in IOS_PORT_NOTES.md: "the code cache is 128 MiB
+	     per core. Whether iOS jetsam counts a large RX mapping as dirty against the
+	     app's footprint decides whether this fits on a 6 GB device at all." This
+	     entitlement asks the system not to suspend the app aggressively; it does not
+	     change how jetsam accounts the mapping. -->
+	<key>com.apple.developer.kernel.increased-debugging-memory-limit</key>
+	<true/>
+</dict>
+</plist>

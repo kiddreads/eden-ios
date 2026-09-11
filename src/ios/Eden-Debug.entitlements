@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- DEBUG variant. Debug configuration, and the third IPA CI produces.
+
+	     A Debug build IS the debugger-attached case - the same condition StikDebug
+	     manufactures on a release device - so this is the variant to install when
+	     diagnosing whether JIT is being granted at all. It is identical to
+	     Eden.entitlements except that it does not ask for the memory-limit
+	     entitlements, keeping the set as small as possible so that a re-signing tool
+	     has the least to object to. If this variant runs and the Release one does not,
+	     the difference is a memory entitlement being rejected at re-sign time, which is
+	     exactly the thing worth isolating.
+
+	     EdenJIT.m reads these key names back out of the embedded signature
+	     (csops(CS_OPS_ENTITLEMENTS_BLOB)) and reports which it found. If the names here
+	     ever change, update EDEN_JIT_ENTITLEMENT_* in Bridge/EdenJIT.h to match or the
+	     probe will report "no entitlement" for a build that has one. -->
+	<key>get-task-allow</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.disable-executable-page-protection</key>
+	<true/>
+</dict>
+</plist>

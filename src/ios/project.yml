@@ -54,6 +54,13 @@ options:
     iOS: '15.0'
   createIntermediateGroups: true
 
+# Declared explicitly rather than relying on the default, because the keys under
+# `settings.configs` below are matched against CONFIGURATION NAMES, not against the
+# debug/release build types. Spelling both out here means the two lists cannot drift.
+configs:
+  Debug: debug
+  Release: release
+
 settings:
   base:
     PRODUCT_NAME: Eden
@@ -99,20 +106,24 @@ settings:
       - '$(SRCROOT)/../libretro_core'
 
     # --- Linking ----------------------------------------------------------
+    # ONE OTHER_LDFLAGS, not a base plus an [arch=arm64] variant. ARCHS is arm64 only,
+    # so a conditional would always win and the base line would be dead weight that
+    # still looks authoritative when someone reads it later.
+    #
     # @-prefixed linker response file written by the preBuildScript below. Full paths,
     # not -l<name>: CMake scatters .a outputs across build-ios/src/*, build-ios/_deps/*
     # and externals, and cemu-ios-muffin's script exists precisely because every
     # hand-listed LIBRARY_SEARCH_PATHS entry produced a fresh "library not found" for
     # an archive that was sitting on disk the whole time.
-    OTHER_LDFLAGS: '@$(SRCROOT)/link-flags.txt $(inherited)'
-
-    # SDL3 is linked unconditionally by audio_core (src/audio_core/CMakeLists.txt:245)
-    # and by input_common (src/input_common/CMakeLists.txt:82), and its iOS backends
-    # are Objective-C categories registered at runtime. Without -ObjC those object
-    # files are dropped from a static archive and the failure is a runtime
-    # "unrecognized selector", not a link error - which is far more expensive to
-    # diagnose than the binary-size cost of keeping them.
-    OTHER_LDFLAGS[arch=arm64]: '-ObjC @$(SRCROOT)/link-flags.txt $(inherited)'
+    #
+    # -ObjC: SDL3 is linked unconditionally by audio_core
+    # (src/audio_core/CMakeLists.txt:245) and by input_common
+    # (src/input_common/CMakeLists.txt:82), and its iOS backends are Objective-C
+    # categories registered at runtime. Without -ObjC those object files are dropped
+    # from a static archive, and the failure is a runtime "unrecognized selector"
+    # rather than a link error - far more expensive to diagnose than the binary size it
+    # costs to keep them.
+    OTHER_LDFLAGS: '-ObjC @$(SRCROOT)/link-flags.txt $(inherited)'
 
     # Eden's archives are C++ and reference libc++ symbols. CMake adds this implicitly;
     # Xcode linking pre-built archives does not.
@@ -130,18 +141,30 @@ settings:
     # with CODE_SIGNING_ALLOWED=NO and then ad-hoc re-signs the one .app three times,
     # once per entitlements file, so under CI these two lines are inert. A Debug build
     # IS the debugger-attached case, which is exactly what StikDebug reproduces.
-    debug:
+    Debug:
       CODE_SIGN_ENTITLEMENTS: Eden-Debug.entitlements
       SWIFT_OPTIMIZATION_LEVEL: '-Onone'
       SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
       GCC_PREPROCESSOR_DEFINITIONS: 'DEBUG=1 $(inherited)'
-    release:
+    Release:
       CODE_SIGN_ENTITLEMENTS: Eden.entitlements
       SWIFT_OPTIMIZATION_LEVEL: '-O'
       # -dead_strip is Xcode's default for Release. It is safe here: nothing in this
       # app is reached only by dlsym. In particular MoltenVK is NOT statically linked
       # (see the frameworks note below), so there are no vk* symbols to strip.
       DEAD_CODE_STRIPPING: 'YES'
+      # Symbol stripping stays OFF, for two concrete reasons rather than caution.
+      #
+      # 1. ci/verify-ipa.sh check 9b asserts _retro_init, _retro_run, _retro_load_game
+      #    and _eden_libretro_set_metal_layer are still present in the shipped binary.
+      #    That check exists because this project has already shipped an archive that
+      #    built green while containing nothing - see the "Check libdynarmic.a actually
+      #    contains the arm64 backend" step in build-ios-core.yml. A stripped binary
+      #    makes the check unanswerable, and an unanswerable gate is not a gate.
+      # 2. Crash reports from a sideloaded build cannot be symbolicated through
+      #    TestFlight here, so the symbols have to be in the binary to be readable at all.
+      STRIP_INSTALLED_PRODUCT: 'NO'
+      COPY_PHASE_STRIP: 'NO'
 
 targets:
   Eden:
