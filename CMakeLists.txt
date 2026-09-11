@@ -389,6 +389,15 @@ find_package(Threads REQUIRED)
 
 find_package(RenderDoc MODULE)
 
+# iOS: openssl-cmake auto-detects the Configure target from the host, so a macOS
+# runner picks darwin64-arm64-cc and libcrypto.a comes out built for macOS. The
+# core is a static lib and is never linked, so this only surfaces at the app's
+# final link. Pin the target so detect_target_platform() is skipped.
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(OPENSSL_TARGET_PLATFORM ios64-xcrun CACHE STRING "OpenSSL Configure target" FORCE)
+    message(STATUS "iOS: pinning OPENSSL_TARGET_PLATFORM to ios64-xcrun")
+endif()
+
 # openssl funniness
 if (YUZU_USE_BUNDLED_OPENSSL)
     set(BUILD_SHARED_LIBS OFF)
