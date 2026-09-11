@@ -425,15 +425,36 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device) 
 }
 
 RETRO_API void retro_init() {
-    Common::Log::Initialize(); // src/common/logging.h:132
-    Common::Log::Start();      // :134
-    LOG_INFO(Frontend, "Eden libretro core: retro_init");
+    // Paths before logging, deliberately. Common::Log::Initialize() resolves
+    // GetEdenPath(EdenPath::LogDir) once and hands it to the file backend by value, and
+    // a second Initialize() early-returns - so the log file cannot be re-pointed later.
+    // With the path manager un-initialised, LogDir is the relative path "log", which is
+    // not writable from an iOS process's working directory.
+    const bool paths_ok = LibretroCore::Content::SetupUserPaths();
 
     // suyu sets a verbose filter plus log_flush_line = true (retro_core.cpp:176-177).
     // Synchronous line-flushed logging through os_log costs measurable frame time on a
     // phone, so default to warnings with flush off.
     Settings::values.log_filter.SetValue("*:Warning");
     Settings::values.log_flush_line.SetValue(false);
+
+    Common::Log::Initialize(); // src/common/logging.h:132
+    Common::Log::Start();      // :134
+
+    // Initialize() parses log_filter exactly once, and on a second retro_init in the
+    // same process it early-returns entirely - so setting the value above is not enough
+    // on its own. Push it into the live filter by hand, the way yuzu_cmd does.
+    {
+        Common::Log::Filter filter;
+        filter.ParseFilterString(Settings::values.log_filter.GetValue());
+        Common::Log::SetGlobalFilter(filter);
+    }
+
+    // SetupUserPaths ran before any sink existed, so its own logging went nowhere.
+    if (!paths_ok) {
+        LOG_WARNING(Frontend, "libretro: no writable data root; Eden's OS default applies");
+    }
+    LOG_INFO(Frontend, "Eden libretro core: retro_init");
 
     g_system = std::make_unique<Core::System>();
 
@@ -452,8 +473,6 @@ RETRO_API void retro_init() {
                                      // engine name against the factories it registers
 
     LibretroCore::Audio::Init();
-
-    void(LibretroCore::Content::SetupUserPaths());
 
     if (!Network::Init()) { // src/network/network.h:15
         LOG_WARNING(Frontend, "libretro: network layer unavailable");
@@ -602,9 +621,13 @@ RETRO_API unsigned retro_get_region() {
 void eden_libretro_set_metal_layer(void* metal_layer, unsigned width, unsigned height) {
     g_metal_layer = metal_layer;
     if (g_emu_window) {
-        // The window was built before the layer arrived. The surface is read by
-        // RendererVulkan's ctor during Core::System::Load, so as long as this lands
-        // before retro_load_game the layer is in place in time.
+        // Resize() only recomputes the framebuffer layout - it does not touch
+        // window_info.render_surface, which is the single field Vulkan::CreateSurface
+        // actually reads. Storing the layer in g_metal_layer alone left render_surface
+        // null, so CreateSurface would have matched no branch and thrown
+        // VK_ERROR_INITIALIZATION_FAILED out of RendererVulkan's member initialiser
+        // list - the exact abort this window type exists to avoid.
+        g_emu_window->SetRenderSurface(metal_layer);
         g_emu_window->Resize(width, height);
     }
 }

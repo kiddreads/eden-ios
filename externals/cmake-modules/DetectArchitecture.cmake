@@ -41,7 +41,28 @@ if (CMAKE_OSX_ARCHITECTURES)
     # and sent every architecture-specific source through the wrapping path for no reason.
     list(LENGTH CMAKE_OSX_ARCHITECTURES EDEN_OSX_ARCH_COUNT)
     if (EDEN_OSX_ARCH_COUNT GREATER 1)
-        set(MULTIARCH_BUILD 1)
+        # A universal build cannot work in this tree, and it is better to say so here
+        # than to fail deep in a compile twenty minutes later.
+        #
+        # The per-architecture guards come from add_definitions(-DARCHITECTURE_<arch>=1)
+        # below, which is a directory property and NOT per-slice - there is no -Xarch_
+        # anywhere in this repository. So in an "arm64;x86_64" build BOTH macros are
+        # defined for BOTH slices, and every `#if defined(ARCHITECTURE_x86_64) / #elif
+        # defined(ARCHITECTURE_arm64)` chain takes its first arm in both. dynarmic's
+        # backend/exception_handler.h is exactly that shape, so the arm64 slice ends up
+        # with only the x86_64 Register() overload declared and address_space.cpp fails
+        # to compile.
+        #
+        # Making this work means emitting the guards per slice and reworking the
+        # CMake-side ARCHITECTURE_* branches too. That is a real piece of work and no
+        # part of this tree asks for it today: the only place that sets
+        # CMAKE_OSX_ARCHITECTURES at all is the iOS toolchain, with a single arm64.
+        message(FATAL_ERROR
+            "Universal builds are not supported: CMAKE_OSX_ARCHITECTURES lists "
+            "${EDEN_OSX_ARCH_COUNT} architectures (${CMAKE_OSX_ARCHITECTURES}). "
+            "ARCHITECTURE_<arch> is defined directory-wide rather than per slice, so "
+            "every architecture guard would be true in every slice. Configure one "
+            "architecture at a time.")
     endif()
     set(ARCHITECTURE "${CMAKE_OSX_ARCHITECTURES}")
 

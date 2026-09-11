@@ -63,6 +63,13 @@ public:
     /// (src/core/frontend/framebuffer_layout.cpp), so the dimensions are clamped.
     void Resize(u32 width, u32 height);
 
+    /// The layer normally arrives after retro_init has already constructed the window,
+    /// so it has to be assigned separately. It MUST land before Core::System::Load:
+    /// RendererVulkan's constructor reads window_info.render_surface exactly once, in
+    /// its member initialiser list, and the surface is never recreated on this platform.
+    /// There is no second chance.
+    void SetRenderSurface(void* metal_layer);
+
     void SetShown(bool value);
 
     u64 PresentedFrameCount() const {

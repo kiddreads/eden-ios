@@ -253,7 +253,20 @@ function(apply_patches patches dir)
         execute_process(
             COMMAND ${PATCH_EXE} -p1
             INPUT_FILE ${patch}
-            WORKING_DIRECTORY ${dir})
+            WORKING_DIRECTORY ${dir}
+            RESULT_VARIABLE patch_result)
+        # Without checking this, a patch that does not apply is silent: patch(1) writes
+        # .rej files and exits non-zero, configure carries on, and the build proceeds
+        # against unpatched sources. Whatever the patch existed to fix is then simply
+        # absent, and the failure surfaces much later as something unrelated - or, worse,
+        # not at all. Bundled patches carry real fixes here (iOS needs Boost.Process not
+        # to reference wordexp, and oaknut to detect mmap failure correctly), so a patch
+        # silently not applying has to be a hard error.
+        if (NOT patch_result EQUAL 0)
+            fatal("Patch ${patch_name} failed to apply in ${dir} "
+                  "(patch exited ${patch_result}); look for .rej files there. "
+                  "The pinned upstream version has probably moved.")
+        endif()
     endforeach()
 endfunction()
 

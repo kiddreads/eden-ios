@@ -90,6 +90,10 @@ bool RetroEmuWindow::WaitForFramePresented(std::chrono::milliseconds timeout) {
     return arrived;
 }
 
+void RetroEmuWindow::SetRenderSurface(void* metal_layer) {
+    window_info.render_surface = metal_layer;
+}
+
 void RetroEmuWindow::Resize(u32 width, u32 height) {
     const u32 w = SanitizeDim(width);
     const u32 h = SanitizeDim(height);
