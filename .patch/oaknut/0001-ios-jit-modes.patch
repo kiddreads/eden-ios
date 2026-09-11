@@ -1,6 +1,6 @@
 --- a/include/oaknut/code_block.hpp
 +++ b/include/oaknut/code_block.hpp
-@@ -30,22 +30,48 @@
+@@ -30,22 +30,41 @@
      {
  #if defined(_WIN32)
          m_memory = (std::uint32_t*)VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
@@ -21,32 +21,25 @@
          if (m_memory == nullptr)
              throw std::bad_alloc{};
 +#else
-+        // mmap reports failure as MAP_FAILED ((void*)-1), never as nullptr. Every branch
-+        // below used to fall through to a `== nullptr` check, so a failed mapping was kept
-+        // as a valid pointer and the first write to it faulted somewhere unrelated. On iOS
-+        // that is the normal outcome when the process has no JIT permission, which turned a
-+        // diagnosable startup condition into an unattributable crash.
++        // mmap reports failure as MAP_FAILED ((void*)-1), never as nullptr, so the
++        // `== nullptr` check below every branch never fired: a failed mapping was kept as a
++        // valid pointer and the first write to it faulted somewhere unrelated. On iOS a
++        // failed mapping is the NORMAL outcome when the process has not been granted the
++        // right to hold executable memory, so the common case produced an unattributable
++        // crash instead of a catchable error.
++        //
++        // Note on iOS and MAP_JIT: the mapping and toggling shape below is deliberately
++        // left exactly as upstream had it. MAP_JIT pairs with
++        // pthread_jit_write_protect_np(), and that function is not merely restricted on
++        // iOS - it is absent from the SDK, declared __attribute__((unavailable)), so even
++        // naming it fails to compile. The mprotect toggle is the only mechanism available
++        // there.
 +        void* mem = MAP_FAILED;
 +#    if defined(__APPLE__)
 +#        if TARGET_OS_IPHONE
-+        // Two different things are allowed to work on iOS, depending on how the app was
-+        // installed, so try both rather than assuming one:
-+        //   * MAP_JIT, paired with pthread_jit_write_protect_np, needs the JIT entitlement
-+        //     to be genuinely present in the signature - a TrollStore-style install.
-+        //   * Plain anonymous memory toggled between RX and RW with mprotect needs the
-+        //     process to be allowed to do that: dynamic-codesigning, or being debugged
-+        //     (CS_DEBUGGED), which is what StikDebug arranges.
-+        // MAP_JIT is tried first because it is the cheaper toggle at runtime - it is a
-+        // per-thread register write rather than a syscall over the whole mapping.
-+        mem = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
-+        if (mem != MAP_FAILED) {
-+            m_uses_map_jit = true;
-+        } else {
-+            mem = mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
-+        }
++        mem = mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
 +#        else
 +        mem = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
-+        m_uses_map_jit = (mem != MAP_FAILED);
 +#        endif
 +#    elif defined(__NetBSD__)
 +        mem = mmap(nullptr, size, PROT_MPROTECT(PROT_READ | PROT_WRITE | PROT_EXEC), MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -63,48 +56,3 @@
      }
  
      ~CodeBlock()
-@@ -72,18 +98,28 @@
- 
-     void protect()
-     {
--#if defined(__APPLE__) && !TARGET_OS_IPHONE
--        pthread_jit_write_protect_np(1);
--#elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
-+#if defined(__APPLE__)
-+        // Which mechanism applies is decided by how the mapping was obtained, not by the
-+        // platform, so it has to be remembered rather than recomputed here.
-+        if (m_uses_map_jit) {
-+            pthread_jit_write_protect_np(1);
-+        } else {
-+            mprotect(m_memory, m_size, PROT_READ | PROT_EXEC);
-+        }
-+#elif defined(__NetBSD__) || defined(__OpenBSD__)
-         mprotect(m_memory, m_size, PROT_READ | PROT_EXEC);
- #endif
-     }
- 
-     void unprotect()
-     {
--#if defined(__APPLE__) && !TARGET_OS_IPHONE
--        pthread_jit_write_protect_np(0);
--#elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
-+#if defined(__APPLE__)
-+        if (m_uses_map_jit) {
-+            pthread_jit_write_protect_np(0);
-+        } else {
-+            mprotect(m_memory, m_size, PROT_READ | PROT_WRITE);
-+        }
-+#elif defined(__NetBSD__) || defined(__OpenBSD__)
-         mprotect(m_memory, m_size, PROT_READ | PROT_WRITE);
- #endif
-     }
-@@ -137,6 +173,9 @@
- 
- protected:
-     std::uint32_t* m_memory;
-+#if defined(__APPLE__)
-+    bool m_uses_map_jit = false;
-+#endif
-     std::size_t m_size = 0;
- };
- 

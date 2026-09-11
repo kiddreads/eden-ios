@@ -68,25 +68,25 @@ just at open time.
 and `KProcess::InitializeInterfaces` constructs `ArmDynarmic64`/`ArmDynarmic32` unconditionally
 with no error path. No JIT does not mean slow emulation; it means no emulation.
 
-Two mechanisms are legitimate on iOS, and which one is available depends on how the app was
-installed, so `oaknut::CodeBlock` tries both:
+**On iOS there is exactly one mechanism, not two.** `oaknut::CodeBlock` maps plain anonymous
+memory and toggles it between RX and RW with `mprotect`. That requires the process to be allowed
+to do it: `dynamic-codesigning` (TrollStore), or being debugged, which sets `CS_DEBUGGED`
+(StikDebug).
 
-| Mechanism | Needs | Typical install |
-|---|---|---|
-| `MAP_JIT` + `pthread_jit_write_protect_np` | JIT entitlement genuinely in the signature | TrollStore |
-| plain anonymous memory toggled RX↔RW with `mprotect` | `dynamic-codesigning`, or being debugged (`CS_DEBUGGED`) | StikDebug |
+The macOS mechanism — `MAP_JIT` paired with `pthread_jit_write_protect_np` — is **not available
+on iOS at all**. `pthread_jit_write_protect_np` is not merely restricted there; it is absent from
+the iOS SDK, declared `__attribute__((unavailable))`, so even naming it is a compile error. An
+attempt to support both mechanisms was made and reverted for exactly this reason; oaknut's
+original split (`#if defined(__APPLE__) && !TARGET_OS_IPHONE`) was correct.
 
-`MAP_JIT` is tried first because its toggle is a per-thread register write rather than a syscall
-over the whole mapping. Whichever succeeded is remembered, because `protect()`/`unprotect()` must
-match the mapping, not the platform.
+What the patch to oaknut does keep is the failure check: `mmap` reports failure as `MAP_FAILED`
+(`(void*)-1`), never `nullptr`, and the upstream code tested for `nullptr`. A failed mapping was
+therefore kept as a valid pointer and faulted later somewhere unrelated — and on iOS a failed
+mapping is the *normal* outcome when JIT is not permitted, so the common case produced an
+unattributable crash. That fix applies to every POSIX platform, not just iOS.
 
-Two hazards worth knowing:
-
-- **`pthread_jit_write_protect_np` is per-thread.** With `use_multi_core` on, a cross-thread
-  unprotect is a silent no-op and the subsequent write faults. The `mprotect` mode is per-mapping
-  and does not have this problem. This is unresolved and needs a device to settle.
-- **Entitlements only exist inside a code signature.** An unsigned build carries none, which is
-  why the artifact has to ship in more than one variant.
+**Entitlements only exist inside a code signature.** An unsigned build carries none, which is why
+the artifact has to ship in more than one variant.
 
 JIT memory is no longer allocated during static initialisation — `SpinLockImpl` was a
 namespace-scope global whose constructor mmapped executable memory at dyld load, before `main()`,
