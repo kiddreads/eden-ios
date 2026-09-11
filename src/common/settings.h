@@ -15,6 +15,11 @@
 #include <utility>
 #include <vector>
 
+#if defined(__APPLE__)
+// For TARGET_OS_IPHONE, used below to pick platform defaults.
+#include <TargetConditionals.h>
+#endif
+
 #include "common/common_types.h"
 #include "common/settings_common.h"
 #include "common/settings_enums.h"
@@ -299,8 +304,23 @@ struct Values {
     Setting<bool> cpuopt_misc_ir{linkage, true, "cpuopt_misc_ir", Category::CpuDebug};
     Setting<bool> cpuopt_reduce_misalign_checks{linkage, true, "cpuopt_reduce_misalign_checks",
                                                 Category::CpuDebug};
-    SwitchableSetting<bool> cpuopt_fastmem{linkage, true, "cpuopt_fastmem", Category::CpuDebug};
-    SwitchableSetting<bool> cpuopt_fastmem_exclusives{linkage, true, "cpuopt_fastmem_exclusives",
+    // Defaults to off on iOS: a 16 KiB host page cannot back a 4 KiB guest page, so the
+    // fastmem arena is never constructed there (see common/host_memory.cpp) and leaving
+    // this on would only advertise an arena that does not exist.
+    SwitchableSetting<bool> cpuopt_fastmem{linkage,
+#if defined(__APPLE__) && defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                                           false,
+#else
+                                           true,
+#endif
+                                           "cpuopt_fastmem", Category::CpuDebug};
+    SwitchableSetting<bool> cpuopt_fastmem_exclusives{linkage,
+#if defined(__APPLE__) && defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+                                                      false,
+#else
+                                                      true,
+#endif
+                                                      "cpuopt_fastmem_exclusives",
                                                       Category::CpuDebug};
     Setting<bool> cpuopt_recompile_exclusives{linkage, true, "cpuopt_recompile_exclusives",
                                               Category::CpuDebug};

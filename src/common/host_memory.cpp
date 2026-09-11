@@ -51,6 +51,20 @@
 
 #endif // ^^^ POSIX ^^^
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
+// The fastmem arena maps guest pages directly into the host address space so that a
+// guest load becomes a host load. That requires host pages no larger than guest pages.
+// The Switch guest uses 4 KiB pages; Apple silicon uses 16 KiB, so on iOS the arena
+// cannot be constructed at all - Impl::Init() asserts on exactly this. Fall back to the
+// page-table MMU instead, which dynarmic already supports whenever fastmem_pointer is
+// nullopt (see src/core/arm/dynarmic/arm_dynarmic_64.cpp).
+#if defined(__APPLE__) && defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+#define EDEN_IOS_NO_FASTMEM 1
+#endif
+
 #include <mutex>
 #include <random>
 
@@ -711,6 +725,27 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
 #if defined(__OPENORBIS__) || defined(__managarm__)
     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
     backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    virtual_base = nullptr;
+#elif defined(EDEN_IOS_NO_FASTMEM)
+    // Deliberately a separate branch from the one above rather than an extra condition on
+    // it: that one never sets fallback_buffer, so ~HostMemory never munmaps what it just
+    // mapped. Rather than change the behaviour of platforms that cannot be tested here,
+    // iOS gets its own branch that releases what it allocates.
+    LOG_WARNING(HW_Memory,
+                "iOS: host page size is 16 KiB and the guest uses 4 KiB, so no fastmem arena "
+                "is possible; falling back to the page-table MMU");
+    {
+        void* const backing = mmap(nullptr, backing_size, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (backing == MAP_FAILED) {
+            LOG_CRITICAL(HW_Memory, "Failed to allocate {} bytes of guest backing memory: {}",
+                         backing_size, strerror(errno));
+            backing_base = nullptr;
+        } else {
+            backing_base = static_cast<u8*>(backing);
+            fallback_buffer = true;
+        }
+    }
     virtual_base = nullptr;
 #else
     // Try to allocate a fastmem arena.
