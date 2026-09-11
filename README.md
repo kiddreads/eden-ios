@@ -20,7 +20,7 @@ under a gigabyte of free disk, so there is no local build and there never will b
 |---|---|---|
 | M0 | Eden's source mirrored into this repo, CI in place | **met** |
 | M1 | Eden's core libraries cross-compile for `iphoneos` arm64 | **met** — all 10 targets, JIT verified present |
-| M2 | A libretro core links for iOS | not started |
+| M2 | A libretro core links for iOS | **met** — `eden_libretro` builds for iphoneos arm64 |
 | M3 | An installable artifact launches on a real device | not started |
 | M4 | A homebrew `.nro` boots and something it draws reaches the screen | not started |
 | M5 | A retail title boots | not started |
@@ -31,7 +31,12 @@ under a gigabyte of free disk, so there is no local build and there never will b
 CMake configure is clean and **all ten core targets build**:
 
 `dynarmic` · `common` · `core` · `hid_core` · `audio_core` · `shader_recompiler` ·
-`video_core` · `network` · `input_common` · `frontend_common`
+`video_core` · `network` · `input_common` · `frontend_common` · `eden_libretro`
+
+The libretro core (M2) is grafted from suyu and builds too. The whole 85 KB graft
+produced exactly one compile error on its first attempt — a vexing parse,
+`void(Qualified::Name())` reading as a declaration — because every Eden API it calls was
+checked against the real headers rather than assumed to match suyu's.
 
 "It compiled" is not the claim, though, so CI also inspects the archive:
 
