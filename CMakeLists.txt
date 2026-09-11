@@ -219,6 +219,12 @@ endif()
 # TODO(crueter): Cleanup, each dep that has a bundled option should allow to choose between bundled, external, system
 option(ENABLE_CUBEB "Enables the cubeb audio backend" ON)
 
+# Build the Eden libretro core. Always STATIC: iOS will not dlopen a core, so it is
+# linked into the frontend app rather than loaded. Off by default - nothing on desktop
+# consumes it yet, and it links core/video_core/hid_core/input_common, so it cannot
+# build until those do.
+option(ENABLE_LIBRETRO "Build the Eden libretro core (static)" OFF)
+
 set(EXT_DEFAULT OFF)
 if (MSVC OR ANDROID)
     set(EXT_DEFAULT ON)

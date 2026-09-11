@@ -272,6 +272,10 @@ add_subdirectory(input_common)
 add_subdirectory(frontend_common)
 add_subdirectory(shader_recompiler)
 
+if (ENABLE_LIBRETRO)
+    add_subdirectory(libretro_core)
+endif()
+
 if (YUZU_TESTS)
     add_subdirectory(tests)
 endif()
