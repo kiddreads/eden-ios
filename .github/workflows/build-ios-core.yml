@@ -1,0 +1,196 @@
+name: Build iOS Core
+
+# M1 gate: does Eden's emulator core cross-compile for iphoneos arm64?
+#
+# Nothing here produces an app. This builds the libraries only - common, core,
+# video_core, shader_recompiler, dynarmic and friends - because that is the part
+# of the port that either works or does not. A frontend on top of a core that does
+# not compile is not worth writing.
+#
+# It is deliberately built to be *informative on failure*: every target is built
+# separately with continue-on-error, and the job summary reports which ones made it.
+# The first runs of this are expected to fail; the useful output is the list of what
+# broke and where, not a green tick.
+#
+# All of this runs on a GitHub runner because the machine driving this port has no
+# Xcode and under a gigabyte of free disk. That is a permanent constraint.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'externals/**'
+      - 'CMakeLists.txt'
+      - 'CMakeModules/**'
+      - 'cpmfile.json'
+      - '.github/workflows/build-ios-core.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-ios-core-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Environment
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "SDK path: $(xcrun --sdk iphoneos --show-sdk-path)"
+          sw_vers
+          df -h / | tail -1
+
+      # Eden requires CMake 3.31+. The runner image lags, so install explicitly.
+      - name: Install build tools
+        run: |
+          brew update --quiet || true
+          brew install cmake ninja || brew upgrade cmake ninja || true
+          cmake --version
+          ninja --version
+
+      # Eden fetches dependencies with CPM at configure time. Cache them or every
+      # run re-downloads the same archives.
+      - name: Cache CPM sources
+        uses: actions/cache@v4
+        with:
+          path: .cache/cpm
+          key: cpm-ios-${{ hashFiles('cpmfile.json', 'CMakeModules/CPMUtil.cmake') }}
+          restore-keys: cpm-ios-
+
+      # ---------------------------------------------------------------------
+      # Configure.
+      #
+      # Everything that is a desktop frontend, a desktop-only backend, or a
+      # network service is off. What is left is the emulator itself.
+      #   ENABLE_QT        - Qt desktop GUI, obviously not on iOS
+      #   YUZU_CMD         - the SDL command-line frontend
+      #   ENABLE_CUBEB     - desktop audio backend; iOS needs CoreAudio instead
+      #   ENABLE_LIBUSB    - no raw USB access on iOS
+      #   ENABLE_WEB_SERVICE / UPDATE_CHECKER / DISCORD - no
+      #   YUZU_ROOM*       - LAN multiplayer room server executables
+      #   YUZU_TESTS       - host-run tests cannot run on an iOS target
+      #   YUZU_DISABLE_LLVM - upstream's own "useful for CI" escape hatch
+      # ---------------------------------------------------------------------
+      - name: Configure
+        id: configure
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cmake -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/CMakeModules/toolchains/iOS.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_QT=OFF \
+            -DENABLE_QT_TRANSLATION=OFF \
+            -DYUZU_CMD=OFF \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DENABLE_CUBEB=OFF \
+            -DENABLE_LIBUSB=OFF \
+            -DENABLE_WEB_SERVICE=OFF \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DENABLE_WIFI_SCAN=OFF \
+            -DYUZU_TESTS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_DISABLE_LLVM=ON \
+            -DYUZU_USE_BUNDLED_FFMPEG=ON \
+            -DYUZU_USE_BUNDLED_SIRIT=ON \
+            -DYUZU_DOWNLOAD_TIME_ZONE_DATA=ON \
+            -DYUZU_DOWNLOAD_ANDROID_VVL=OFF \
+            2>&1 | tee configure.log
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Configure failure digest
+        if: steps.configure.outcome != 'success'
+        run: |
+          echo "## Configure FAILED" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -nE "CMake Error|error:|Could NOT find|FATAL" configure.log | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "--- last 60 lines ---"
+          tail -60 configure.log
+
+      - name: List available targets
+        if: steps.configure.outcome == 'success'
+        run: |
+          ninja -C build -t targets all 2>/dev/null | grep -oE '^[^:]*\.a' | sort -u | head -60 || true
+          echo "--- cmake target list ---"
+          cmake --build build --target help 2>/dev/null | head -60 || true
+
+      # ---------------------------------------------------------------------
+      # Build the core libraries one at a time so a failure in video_core does not
+      # hide the fact that common and core were fine. Order is roughly dependency
+      # order, so the first failure is usually the real one.
+      # ---------------------------------------------------------------------
+      - name: Build core libraries
+        if: steps.configure.outcome == 'success'
+        run: |
+          set -u
+          TARGETS="dynarmic common core hid_core audio_core shader_recompiler video_core network input_common frontend_common"
+          echo "| target | result |" >  result.md
+          echo "|---|---|"           >> result.md
+          for t in $TARGETS; do
+            if ! ninja -C build -t targets all 2>/dev/null | grep -q "^$t"; then
+              if ! cmake --build build --target "$t" -- -n >/dev/null 2>&1; then
+                echo "| \`$t\` | not a target |" >> result.md
+                echo "::notice::$t is not a target in this configuration, skipping"
+                continue
+              fi
+            fi
+            echo "=================== building $t ==================="
+            if cmake --build build --target "$t" -j"$(sysctl -n hw.ncpu)" 2>&1 | tee "build-$t.log"; then
+              echo "| \`$t\` | built |" >> result.md
+              echo "::notice::$t BUILT"
+            else
+              echo "| \`$t\` | FAILED |" >> result.md
+              echo "::error::$t failed to build"
+              echo "--- first errors in $t ---"
+              grep -nE "error:|Error " "build-$t.log" | head -25 || true
+            fi
+          done
+          cat result.md
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## iOS core cross-compile (M1)"
+            echo ""
+            echo "Target: \`iphoneos\` arm64, deployment target 15.0"
+            echo ""
+            if [ -f result.md ]; then cat result.md; else echo "_configure did not succeed; no targets attempted_"; fi
+            echo ""
+            echo "### First errors"
+            echo '```'
+            for f in build-*.log; do
+              [ -f "$f" ] || continue
+              grep -hoE "error: .*" "$f" | sort -u | head -8 | sed "s|^|$(basename "$f" .log): |"
+            done | head -50
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-core-logs
+          path: |
+            configure.log
+            build-*.log
+            build/CMakeCache.txt
+            build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: warn
+          retention-days: 14
