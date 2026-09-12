@@ -55,4 +55,13 @@
 #import "EdenJIT.h"
 #import "EdenMetalLayerView.h"
 
+// Key/firmware status and install - the firmware setup screen's entire C surface
+// (eden_content_snapshot, eden_content_install_keys, eden_content_install_firmware,
+// eden_content_verify_firmware, the EdenContentPathId/EdenContentSnapshot/
+// EdenFirmwareCheck types). Declared in src/ios/App/EdenContentBridge.h, which
+// existed on disk but was never imported here - every Swift file that called these
+// failed with "cannot find ... in scope" because the bridging header, not the
+// missing declarations, is what the Swift compiler actually consults.
+#import "EdenContentBridge.h"
+
 #endif // EDEN_BRIDGING_HEADER_H
