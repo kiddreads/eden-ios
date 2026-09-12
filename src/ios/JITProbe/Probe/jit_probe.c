@@ -184,12 +184,14 @@ static const char *const JP_NAMES[JP_STRATEGY_COUNT] = {
     "anonymous RX at map time, RW to write, back to RX",
     "MAP_JIT, RWX at map time",
     "MAP_JIT read-write, then mprotect to RX",
+    "anonymous RWX at map time (no MAP_JIT), then mprotect down to RX",
 };
 
 static const char *const JP_DETAILS[JP_STRATEGY_COUNT] = {
-    "THE ONE THAT DECIDES THE PORT. docs/IOS_PORT_NOTES.md: \"oaknut::CodeBlock maps "
-    "plain anonymous memory and toggles it between RX and RW with mprotect\". If this "
-    "strategy does not work, Eden does not run on this device.",
+    "Eden's ORIGINAL design for this (superseded 2026-09-12, kept here for "
+    "comparison): oaknut::CodeBlock mapped memory without EXECUTE from the start "
+    "and asked mprotect() to add it later. A real device showed that fails - see "
+    "strategy 4, which replaced it.",
 
     "The same memory, mapped executable up front instead of promoted. This is the "
     "exact shape src/ios/Bridge/EdenJIT.m probes (mmap PROT_READ|PROT_EXEC, mprotect "
@@ -205,6 +207,20 @@ static const char *const JP_DETAILS[JP_STRATEGY_COUNT] = {
     "MAP_JIT without asking for PROT_EXEC at map time. cemu-ios-muffin found THIS "
     "succeeded on the device where the one above failed. It never executed the page, "
     "so what a jump into it does is unknown to both projects. This probe finds out.",
+
+    "Added after a real device showed strategies 0 and 1 both SIGBUS: mprotect() "
+    "does not fail when asked for a bit that was not in the mapping's ORIGINAL "
+    "mmap() protection - it silently intersects with that ceiling and returns "
+    "success anyway, so a page that was never mapped executable cannot become "
+    "executable later no matter what mprotect() claims. This asks for "
+    "READ|WRITE|EXECUTE in the one mmap() call, then mprotects DOWN to RX before "
+    "running - removing a bit that was already granted, never adding one that "
+    "was not. This is the exact shape MeloNX's DualMappedJitAllocator uses after "
+    "hitting and fixing the identical bug, confirmed executing real JIT-compiled "
+    "code on this device class. THIS IS WHAT EDEN'S OAKNUT PATCH ACTUALLY DOES NOW "
+    "(.patch/oaknut/0001-ios-jit-modes.patch, 2026-09-12) - if this row fails, the "
+    "patch is wrong and needs another look; if strategies 0/1 fail and this one "
+    "passes, the fix is confirmed.",
 };
 
 // ===========================================================================
@@ -655,6 +671,12 @@ static void jp_run_strategy(int index) {
     case 3:
         page = mmap(NULL, page_len, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        break;
+    case 4:
+        // No MAP_JIT: max_protection on Darwin is fixed at THIS call, so every bit
+        // the page will ever need has to be requested here, not added later.
+        page = mmap(NULL, page_len, PROT_READ | PROT_WRITE | PROT_EXEC,
+                    MAP_PRIVATE | MAP_ANON, -1, 0);
         break;
     default:
         return;
@@ -1210,9 +1232,12 @@ bool jp_strategy_is_fatal(int index) {
 }
 
 bool jp_strategy_is_decisive(int index) {
-    // Strategy 0 is the shape docs/IOS_PORT_NOTES.md says oaknut::CodeBlock uses.
-    // Every other row is diagnostic; this one is the project's answer.
-    return index == 0;
+    // Strategy 4 is the shape .patch/oaknut/0001-ios-jit-modes.patch actually gives
+    // CodeBlock on iOS as of 2026-09-12 - RWX in one mmap() call, mprotected down.
+    // Strategy 0 held this title until a real device showed it, and strategy 1
+    // (oaknut's actual prior shape), both fail. Every other row is diagnostic;
+    // this one is the project's current answer.
+    return index == 4;
 }
 
 // ===========================================================================
