@@ -322,58 +322,31 @@ struct ProbeView: View {
             Text("The four ways of asking")
                 .font(.headline)
             ForEach(model.rows) { row in
-                HStack(alignment: .top, spacing: 12) {
-                    icon(for: row)
-                        .frame(width: 24)
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 6) {
-                            Text(row.label)
-                                .font(.subheadline.weight(.semibold))
-                            if row.isDecisive {
-                                Text("THE ONE THAT COUNTS")
-                                    .font(.caption2.weight(.bold))
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color.accentColor.opacity(0.18))
-                                    .cornerRadius(4)
-                            }
-                        }
-                        Text(model.currentlyTesting == row.id ? "testing now…" : row.outcome)
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-                    }
-                    Spacer(minLength: 0)
-                }
+                StrategyRow(row: row, isTesting: model.currentlyTesting == row.id)
             }
-        }
-    }
-
-    @ViewBuilder
-    private func icon(for row: ProbeModel.Row) -> some View {
-        if model.currentlyTesting == row.id {
-            ProgressView()
-        } else if row.isPass {
-            Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
-        } else if row.isFatal {
-            Image(systemName: "xmark.octagon.fill").foregroundColor(.red)
-        } else if row.isUntried {
-            Image(systemName: "circle.dashed").foregroundColor(.secondary)
-        } else {
-            Image(systemName: "minus.circle.fill").foregroundColor(.orange)
         }
     }
 
     // MARK: buttons
 
+    // Precomputed rather than inline: a Label(ternary, systemImage: ternary) - two
+    // ternaries resolving into one overloaded call, inside a Button closure that also
+    // captures external state - is a documented SwiftUI type-checker timeout shape.
+    // Plain, non-view computed properties carry no inference cost.
+    private var copyButtonTitle: String { copied ? "Copied" : "Copy the full report" }
+    private var copyButtonIcon: String { copied ? "checkmark" : "doc.on.doc" }
+    private var toggleButtonTitle: String { showRawReport ? "Hide the details" : "Show the details" }
+
+    private func copyReportTapped() {
+        model.copyReport()
+        copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
+    }
+
     private var actions: some View {
         VStack(spacing: 12) {
-            Button {
-                model.copyReport()
-                copied = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
-            } label: {
-                Label(copied ? "Copied" : "Copy the full report",
-                      systemImage: copied ? "checkmark" : "doc.on.doc")
+            Button(action: copyReportTapped) {
+                Label(copyButtonTitle, systemImage: copyButtonIcon)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
             }
@@ -384,7 +357,7 @@ struct ProbeView: View {
             Button {
                 showRawReport.toggle()
             } label: {
-                Text(showRawReport ? "Hide the details" : "Show the details")
+                Text(toggleButtonTitle)
                     .frame(maxWidth: .infinity)
             }
 
@@ -418,5 +391,62 @@ struct ProbeView: View {
              """)
             .font(.caption)
             .foregroundColor(.secondary)
+    }
+}
+
+// Pulled out of strategyList's ForEach closure on purpose. A closure-based ForEach
+// row body with nested stacks, a conditional badge, and a ternary Text is the other
+// half of the type-check timeout this file hit; SwiftUI checks a named struct's body
+// far more cheaply than an inferred closure with the same content.
+private struct StrategyRow: View {
+    let row: ProbeModel.Row
+    let isTesting: Bool
+
+    private var outcomeText: String {
+        isTesting ? "testing now…" : row.outcome
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            icon
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(row.label)
+                        .font(.subheadline.weight(.semibold))
+                    if row.isDecisive {
+                        decisiveBadge
+                    }
+                }
+                Text(outcomeText)
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var decisiveBadge: some View {
+        Text("THE ONE THAT COUNTS")
+            .font(.caption2.weight(.bold))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.accentColor.opacity(0.18))
+            .cornerRadius(4)
+    }
+
+    @ViewBuilder
+    private var icon: some View {
+        if isTesting {
+            ProgressView()
+        } else if row.isPass {
+            Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+        } else if row.isFatal {
+            Image(systemName: "xmark.octagon.fill").foregroundColor(.red)
+        } else if row.isUntried {
+            Image(systemName: "circle.dashed").foregroundColor(.secondary)
+        } else {
+            Image(systemName: "minus.circle.fill").foregroundColor(.orange)
+        }
     }
 }
