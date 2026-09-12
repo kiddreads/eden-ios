@@ -27,6 +27,7 @@ add_library(eden_libretro STATIC
     retro_input.h
     retro_video.cpp
     retro_video.h
+    vma_impl.cpp
 )
 
 create_target_directory_groups(eden_libretro)
