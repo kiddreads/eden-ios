@@ -244,6 +244,14 @@ done
 `--generate-entitlement-der` matters for the same reason it does in Eden's workflow: a
 signature carrying only the XML blob reads as declaring no entitlements to some checks.
 
+(The four variants above are illustrative, not what CI actually ships. The `debug` one
+re-signs a *Release* binary with `JITProbe-Debug.entitlements`, which declares the same
+three keys as `JITProbe.entitlements` — so it comes out byte-for-byte identical to
+`sideload` under another name. `.github/workflows/build-jit-probe.yml` packages `unsigned`
+in that slot instead — a plain, unsigned copy of the `.app` for SideStore/AltStore to
+re-sign themselves — and adds it to `sideload`/`trollstore`/`none` rather than replacing
+one of them, so CI ships four IPAs that are four distinct pieces of information.)
+
 **This has never been through `xcodebuild`.** The machine driving this port has no Xcode
 (`README.md`: "no local build and there never will be"). What *has* been done is stronger
 than nothing and is stated exactly: `Probe/jit_probe.c` compiles clean under
@@ -252,7 +260,21 @@ the macOS SDK, and was **compiled, run, and its output read** as a native arm64 
 including the crash-journal replay path, driven by planting a journal file by hand. The
 Swift and the `project.yml` have not been compiled by anything.
 
-Adding a CI job is a change to `.github/workflows/`, which this directory does not own.
+`.github/workflows/build-jit-probe.yml` now does exactly the build/package/verify sequence
+above on `macos-15` via `xcodegen` + `xcodebuild`, and it has been reviewed accordingly —
+but it has never actually been run by GitHub Actions, because the machine driving this
+port cannot start a workflow run either. What was checked instead, all read/replay, no
+build: every path the workflow touches exists on disk; `src/ios/JITProbe/project.yml`
+parses as YAML with the keys XcodeGen expects; the workflow YAML itself parses; every
+step's script is `bash -n` clean; the two independence gates (quoted-include scan,
+`project.yml` coupling scan) were re-run by hand against the real files here and pass;
+and the packaging + entitlement-verification steps (`Package four IPAs`, `Verify every
+IPA`, the `check-entitlements.py` helper written by `Write the verification helpers`) were
+exercised end-to-end against a synthetic stand-in `.app` — real `Info.plist`, real
+`*.entitlements` files from this directory, `codesign --generate-entitlement-der`, the DER
+blob check — and produced four correctly-signed, correctly-verified IPAs. None of that
+touches `xcodebuild` itself: whether the Swift, the bridging header, and `jit_probe.c`
+actually compile and link as an iOS app is still open until a runner does it.
 
 ## Files
 
