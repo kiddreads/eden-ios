@@ -141,16 +141,8 @@ struct ProbeView: View {
     var body: some View {
         NavigationView {
             ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    verdictBanner
-                    meaning
-                    if model.resumedAfterKill { killNotice }
-                    if !model.journalWritable { journalWarning }
-                    strategyList
-                    actions
-                    footnote
-                }
-                .padding(20)
+                content
+                    .padding(20)
             }
             .navigationTitle("Eden JIT probe")
             .navigationBarTitleDisplayMode(.inline)
@@ -159,6 +151,43 @@ struct ProbeView: View {
         .task {
             model.begin()
             await model.runAll()
+        }
+    }
+
+    // Split out of `body`, and split again into halves below, because Swift's type
+    // checker gave up on the original single expression:
+    //   "the compiler is unable to type-check this expression in reasonable time"
+    // Seven heterogeneous sub-views plus two conditional branches in one VStack is
+    // enough to make inference blow up. Each @ViewBuilder property gets its own
+    // annotated result type, so the checker never has to solve the whole tree at once.
+    @ViewBuilder
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            topSection
+            bottomSection
+        }
+    }
+
+    @ViewBuilder
+    private var topSection: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            verdictBanner
+            meaning
+            if model.resumedAfterKill {
+                killNotice
+            }
+            if !model.journalWritable {
+                journalWarning
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var bottomSection: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            strategyList
+            actions
+            footnote
         }
     }
 
