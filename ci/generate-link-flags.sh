@@ -113,7 +113,23 @@ fi
 CPM_CACHE_DIR="${EDEN_CPM_CACHE_DIR:-$REPO_ROOT/.cache/cpm}"
 if [ -d "$CPM_CACHE_DIR" ]; then
     echo "generate-link-flags.sh: scanning $CPM_CACHE_DIR (CPM prebuilt packages)"
-    CPM_ARCHIVES="$(find "$CPM_CACHE_DIR" -name '*.a' -not -path '*/debug/*' | sort -u)"
+    # cpmfile.json's "moltenvk" entry (repo V380-Ori/Ryujinx.MoltenVK) fetches
+    # "MoltenVK-macOS.tar" UNCONDITIONALLY - the artifact name is not platform-
+    # parameterised the way ffmpeg-ci's is, so it lands in the CPM cache as a macOS
+    # slice regardless of what is actually being built. The broad find below
+    # swept it up and handed the linker
+    #   .cache/cpm/moltenvk/.../MoltenVK.xcframework/macos-arm64_x86_64/libMoltenVK.a
+    # which failed with "building for iOS, but linking in object file ... built for
+    # macOS" - a real app-link failure, not a warning.
+    #
+    # It should never have been a candidate at all: this project's whole MoltenVK
+    # design, above, is that it reaches the app as an embedded RUNTIME DYLIB via
+    # ci/fetch-moltenvk.sh, and nothing on the iOS side links it statically -
+    # MOLTENVK_LIBRARY is consumed only by src/yuzu (the Qt desktop target, which
+    # this build has ENABLE_QT=OFF for). Excluded by package name rather than by
+    # platform string, so a future macOS-only CPM package cannot repeat this by
+    # happening to share a slice name.
+    CPM_ARCHIVES="$(find "$CPM_CACHE_DIR" -name '*.a' -not -path '*/debug/*' -not -path '*/moltenvk/*' | sort -u)"
     if [ -n "$CPM_ARCHIVES" ]; then
         ARCHIVES="$(printf '%s\n%s\n' "$ARCHIVES" "$CPM_ARCHIVES" | sort -u)"
     fi
