@@ -239,7 +239,7 @@ struct ProbeView: View {
 
                    If the app closes by itself, that is a result, not a crash — it \
                    means iOS refused. Just open it again and it will carry on from \
-                   where it stopped. You may have to do that up to four times.
+                   where it stopped. You may have to do that up to five times.
                    """
         } else if model.passed {
             return """
@@ -322,7 +322,7 @@ struct ProbeView: View {
 
     private var strategyList: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("The four ways of asking")
+            Text("The five ways of asking")
                 .font(.headline)
             ForEach(model.rows) { row in
                 StrategyRow(row: row, isTesting: model.currentlyTesting == row.id)
