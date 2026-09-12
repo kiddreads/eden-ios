@@ -44,6 +44,17 @@ final class ProbeModel: ObservableObject {
 
     private var started = false
 
+    private func makeRow(at index: Int) -> Row {
+        let i = Int32(index)
+        return Row(id: index,
+                   label: String(cString: jp_strategy_label(i)),
+                   outcome: String(cString: jp_strategy_outcome_text(i)),
+                   isPass: jp_strategy_is_pass(i),
+                   isFatal: jp_strategy_is_fatal(i),
+                   isUntried: jp_strategy_is_untried(i),
+                   isDecisive: jp_strategy_is_decisive(i))
+    }
+
     func refresh() {
         headline = String(cString: jp_headline())
         finished = jp_all_done()
@@ -53,15 +64,7 @@ final class ProbeModel: ObservableObject {
         debuggerPresent = jp_cs_debugged()
 
         let total = Int(jp_strategy_total())
-        rows = (0..<total).map { index in
-            Row(id: index,
-                label: String(cString: jp_strategy_label(Int32(index))),
-                outcome: String(cString: jp_strategy_outcome_text(Int32(index))),
-                isPass: jp_strategy_is_pass(Int32(index)),
-                isFatal: jp_strategy_is_fatal(Int32(index)),
-                isUntried: jp_strategy_is_untried(Int32(index)),
-                isDecisive: jp_strategy_is_decisive(Int32(index)))
-        }
+        rows = (0..<total).map(makeRow)
 
         var buffer = [CChar](repeating: 0, count: 16384)
         buffer.withUnsafeMutableBufferPointer { raw in
