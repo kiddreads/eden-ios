@@ -245,4 +245,17 @@ target_sources(audio_core PRIVATE
 target_link_libraries(audio_core PRIVATE SDL3::SDL3)
 target_compile_definitions(audio_core PRIVATE HAVE_SDL3)
 
+# The libretro core cannot be picked from Settings::AudioEngine, so it installs itself at
+# runtime through AudioCore::Sink::SetSinkOverride (sink/sink_details.cpp). ENABLE_LIBRETRO
+# was only ever a CMake option (top-level CMakeLists.txt:226, used at src/CMakeLists.txt:275
+# to add the libretro_core subdirectory) and never a compile definition; sink_details.cpp
+# needs it as one. PRIVATE: only audio_core's own sources test it, and audio_core must not
+# start exporting a definition that changes how its headers read to every consumer.
+#
+# With ENABLE_LIBRETRO off - every desktop and Android configuration - this adds nothing
+# and sink_details.cpp preprocesses to exactly what it was before the override existed.
+if (ENABLE_LIBRETRO)
+    target_compile_definitions(audio_core PRIVATE ENABLE_LIBRETRO)
+endif()
+
 create_target_directory_groups(audio_core)

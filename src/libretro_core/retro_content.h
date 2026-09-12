@@ -11,7 +11,9 @@
 #include <cstddef>
 #include <filesystem>
 #include <string>
+#include <vector>
 
+#include "common/common_types.h"
 #include "core/core.h"
 
 // WHERE EDEN ACTUALLY READS KEYS AND FIRMWARE
@@ -41,10 +43,15 @@
 //     are 32 hex digits plus ".nca" or ".cnmt.nca" (registered_cache.cpp:56-63), either
 //     directly in that directory or one level down inside a "000000XX" bucket
 //     (registered_cache.cpp:622-655). Any other name is invisible to it, which is why
-//     the user must extract a firmware archive WITHOUT renaming anything.
+//     the user must extract a firmware archive WITHOUT renaming anything - and why
+//     InstallFirmwareFrom() below does that extraction itself rather than trusting a
+//     file manager to preserve the names.
 //
-//   IMPORT DROP-OFF - <root>/keys_import. Not an Eden concept; this port's own. The app
-//     writes an imported key file here and AdoptKeys() copies it into <root>/keys.
+//   IMPORT DROP-OFF - <root>/keys_import. Not an Eden concept; this port's own. A user
+//     who copies a key file there through Files.app gets it installed at the next load,
+//     because AdoptKeys() copies it into <root>/keys. InstallKeysFrom() is the direct
+//     route and takes effect immediately; both exist because a user with Files.app open
+//     will not find an in-app importer, and a user in the app will not find Files.app.
 //
 // WHAT FAILS, AND HOW
 //   No keys at all: Core::System::Load returns ErrorLoader + ErrorMissingProductionKeyFile
@@ -60,14 +67,59 @@
 //     Missing firmware shows up later as a service failure inside the guest. That is the
 //     whole reason for the pre-load firmware check below.
 //
+// WHY frontend_common IS STILL NOT LINKED - verified, not assumed
+//   src/frontend_common/firmware_manager.h was read in full for this pass, together with
+//   its include graph and content_manager.h. The build objection turned out to be
+//   unfounded and the functional objection turned out to be decisive.
+//
+//   The include graph is FINE. firmware_manager.h includes core/hle/service/am/frontend/
+//   applet_mii_edit.h, and that header includes only core/hle/result.h,
+//   applet_mii_edit_types.h and applets.h - all inside the `core` target, which this
+//   target already links PUBLIC. frontend_common is added unconditionally
+//   (src/CMakeLists.txt:272) so it is already built for iphoneos. content_manager.h
+//   pulls <boost/algorithm/string.hpp>, which would need Boost::headers on this target,
+//   but firmware_manager.h does not include content_manager.h - only its .cpp does.
+//   So "including it breaks the build" was wrong. It does not.
+//
+//   What is wrong is the API, for this frontend, in three concrete ways:
+//
+//   1. FirmwareManager::VerifyFirmware (firmware_manager.cpp:119-133) and
+//      CheckFirmwarePresence (firmware_manager.h:66-82) both take a live Core::System&
+//      and go through system.GetFileSystemController().GetSystemNANDContents(), which is
+//      null until FileSystemController::CreateFactories runs inside a game load
+//      (filesystem.cpp:517-523). A SETUP screen has to answer before the first load.
+//      VerifyFirmware() below builds its own RegisteredCache over the same directory and
+//      needs no Core::System at all.
+//
+//   2. FirmwareManager::GetFirmwareVersion (firmware_manager.h:96-105) calls
+//      Service::Set::GetFirmwareVersionImpl, which FALLS BACK to
+//      SystemArchive::SynthesizeSystemArchive when the real NCA is absent
+//      (system_settings_server.cpp:83-86). The synthesized archive returns the hardcoded
+//      constants in api_version.h (system_version.cpp:14-40). So it reports a plausible
+//      firmware version on a machine with NO firmware installed. VerifyFirmware() reads
+//      the NCA and only the NCA, so "unknown" stays unknown.
+//
+//   3. FirmwareManager::InstallKeys (firmware_manager.cpp:22-117) requires the path it is
+//      given to BE prod.keys - `prod_keys_found` is false otherwise and it returns
+//      ErrorWrongFilename (firmware_manager.cpp:90-92). Installing a title.keys on its
+//      own, which is the normal second step for eShop dumps, is not expressible. It also
+//      has no ZIP path and no firmware install at all.
+//
+//   None of that is a criticism of frontend_common - it is written for a frontend that
+//   already has a running system and a desktop file dialog. It is the wrong shape here.
+//   The functions below deliberately reproduce its SEMANTICS where they overlap:
+//   FirmwareRegistered() is CheckFirmwarePresence's predicate, and KeysPresent() is
+//   ContentManager::AreKeysPresent() (content_manager.h:379-381).
+//
 // THREADING AND SIDE EFFECTS
 //   None of this is synchronised, and it cannot be: it reads globals
 //   (LibretroCore::g_data_root_override, g_environ_cb), Common::FS's EdenPath table, and
 //   the process-wide Core::Crypto::KeyManager singleton, none of which has a lock.
 //   Call these from the one dedicated core thread described in
 //   src/ios/Bridge/EdenCoreBridge.h, or from anywhere BEFORE that thread starts - never
-//   concurrently with a load. SetupUserPaths(), AdoptKeys() and Describe() all WRITE:
-//   they create directories, and AdoptKeys/Describe can reload the keyring.
+//   concurrently with a load. SetupUserPaths(), AdoptKeys(), InstallKeysFrom() and
+//   Describe() all WRITE: they create directories, and the first three reload the
+//   keyring. InstallFirmwareFrom() writes files and, with replace_existing, deletes them.
 //   Called before Common::Log::Initialize(), their logging goes nowhere; the return
 //   values are still correct.
 
@@ -79,24 +131,34 @@ namespace LibretroCore::Content {
 /// keyring. It is not a prediction that a particular ROM will load: a ROM can still
 /// fail with a per-title key error (see DescribeLoadFailure) while the status here
 /// says Ready.
+///
+/// The numeric values are mirrored by EdenContentStatus in
+/// src/ios/App/EdenContentBridge.h. Append, never reorder.
 enum class Status {
     /// No writable data root is known, so nothing can be checked or installed.
     /// Only reachable when eden_libretro_set_data_root() was never called AND the
     /// libretro frontend supplied no system directory.
-    NoDataRoot,
+    NoDataRoot = 0,
     /// No prod.keys (or dev.keys, when Settings::values.use_dev_keys is set) exists
     /// in the keys directory. Nothing encrypted can be opened at all.
-    NoKeys,
+    NoKeys = 1,
     /// The key file exists but the keyring it produced is incomplete: Eden could not
     /// derive every master/key-area/titlekek pair it needs, or the header key is
     /// absent. In practice this is a truncated file, a file for an older firmware
     /// generation, or a file whose lines Eden's parser rejected.
-    BadKeys,
+    BadKeys = 2,
     /// Keys are complete; the emulated system NAND holds no firmware NCAs.
     /// NOT a blocker - most titles boot without firmware. Report it, do not refuse.
-    NoFirmware,
+    NoFirmware = 3,
+    /// Firmware files are on disk but VerifyFirmware() could not parse a system
+    /// version out of them. Only reachable from Describe(true).
+    FirmwareUnreadable = 4,
+    /// Firmware parsed, and its major version is NEWER than the Horizon OS version
+    /// this build emulates (HLE::ApiVersion::HOS_VERSION_MAJOR, api_version.h:19).
+    /// Only reachable from Describe(true).
+    FirmwareWrongVersion = 5,
     /// Keys are complete and firmware NCAs are present.
-    Ready,
+    Ready = 6,
 };
 
 /// Every directory the user is ever told about, resolved against the root that was
@@ -114,6 +176,50 @@ struct Paths {
     std::filesystem::path base_key_file;
 };
 
+/// How VerifyFirmware() judged the installed set.
+enum class FirmwareVerdict {
+    /// Parsed, and the system version was read out of the SystemVersion title.
+    Good = 0,
+    NoDataRoot = 1,
+    /// No NCA-named files at all.
+    NotInstalled = 2,
+    /// The keyring is incomplete, so no NCA header can be decrypted and nothing can
+    /// be parsed. Fix the keys first; this says nothing about the firmware.
+    KeysMissing = 3,
+    /// Files are present and none of them parsed into anything usable.
+    Unreadable = 4,
+    /// NCAs parsed, but the system titles this checks for are not among them - a
+    /// partial extraction, or somebody's "minimal" firmware set.
+    Incomplete = 5,
+    /// Parsed; the installed major version is newer than this build emulates.
+    WrongVersion = 6,
+};
+
+/// The outcome of parsing the installed firmware. Filled by VerifyFirmware().
+struct FirmwareReport {
+    /// Defaulted to NotInstalled rather than to the zero enumerator: FirmwareVerdict::Good
+    /// IS zero, so a value-initialised FirmwareReport that nobody filled in would
+    /// otherwise claim the firmware is fine.
+    FirmwareVerdict verdict = FirmwareVerdict::NotInstalled;
+    /// Name-matched NCA files, i.e. the same number CountFirmwareNcas() returns.
+    std::size_t nca_count;
+    /// The Mii Edit applet's Program NCA is in the set - the same predicate
+    /// FirmwareManager::CheckFirmwarePresence uses (firmware_manager.h:66-82).
+    bool has_system_applet;
+    /// A system version was decoded out of title 0x0100000000000809.
+    bool version_known;
+    u8 major;
+    u8 minor;
+    u8 micro;
+    /// The "display_version" string from the version file, e.g. "19.0.1". Empty when
+    /// version_known is false.
+    std::string display_version;
+    /// The "display_title" string, e.g. "NintendoSDK Firmware for NX 19.0.1-3.0".
+    std::string display_title;
+    /// One sentence naming what actually happened. Always set.
+    std::string detail;
+};
+
 /// Everything the iOS UI needs to say something true about setup state.
 struct Report {
     Status status;
@@ -122,6 +228,8 @@ struct Report {
     bool base_key_file_present;
     /// title.keys is on disk. Optional: only personalised/eShop dumps need it.
     bool title_key_file_present;
+    /// console.keys is on disk. Optional.
+    bool console_key_file_present;
     /// key_retail.bin is on disk. Amiibo only; never affects whether a game runs.
     bool amiibo_key_file_present;
     /// The keyring derived from those files is complete
@@ -130,7 +238,78 @@ struct Report {
     /// Number of files under firmware_dir whose names match the NCA-id format the
     /// RegisteredCache scans for. 0 means no firmware.
     std::size_t firmware_nca_count;
+    /// Filled only when Describe(true) ran the parse. `firmware.verdict` is
+    /// FirmwareVerdict::NotInstalled and `detail` is empty otherwise.
+    bool firmware_verified;
+    FirmwareReport firmware;
 };
+
+/// Result of InstallKeysFrom().
+enum class KeyInstallResult {
+    /// Installed, and the keyring is now complete.
+    Ok = 0,
+    NoDataRoot = 1,
+    /// Nothing exists at the given path.
+    SourceMissing = 2,
+    /// Nothing at that path is a key file Eden reads. See KEY_FILE_NAMES.
+    WrongName = 3,
+    /// The copy failed - permissions, or no space.
+    CopyFailed = 4,
+    /// Files were installed and the keyring is STILL incomplete. Almost always a
+    /// prod.keys from an older system version than the content being opened.
+    StillUnusable = 5,
+};
+
+struct KeyInstallReport {
+    KeyInstallResult result;
+    /// Canonical names actually written into the keys directory.
+    std::vector<std::string> installed;
+    /// Files that were looked at and skipped, with the reason attached.
+    std::vector<std::string> ignored;
+    /// A sentence for the user. Always set.
+    std::string message;
+};
+
+/// Result of InstallFirmwareFrom().
+enum class FirmwareInstallResult {
+    /// At least one NCA installed and nothing failed.
+    Ok = 0,
+    NoDataRoot = 1,
+    /// Nothing exists at the given path.
+    SourceMissing = 2,
+    /// Not a directory, and not a ZIP this can read.
+    Unreadable = 3,
+    /// Read successfully; it held no file whose name matches the NCA-id format.
+    NothingFound = 4,
+    /// Some NCAs installed, some failed.
+    Partial = 5,
+    /// NCAs were found and none could be written.
+    WriteFailed = 6,
+};
+
+struct FirmwareInstallReport {
+    FirmwareInstallResult result;
+    /// NCAs written into the firmware directory.
+    std::size_t installed;
+    /// Entries read and ignored because their names are not NCA ids.
+    std::size_t skipped;
+    /// Entries that ARE NCA ids and could not be installed (bad CRC, unsupported
+    /// compression, write error).
+    std::size_t failed;
+    /// Up to the first few failures, each naming the file and the reason. Truncated
+    /// on purpose: a corrupt archive produces one line per entry and no user reads
+    /// four hundred of them.
+    std::vector<std::string> problems;
+    /// A sentence for the user. Always set.
+    std::string message;
+};
+
+/// The five file names anything in Eden ever opens out of the keys directory:
+///   prod.keys / dev.keys / title.keys / console.keys - key_manager.cpp:570-580
+///   key_retail.bin (amiibo only)                     - amiibo_crypto.cpp:284, :307
+/// Exposed because a frontend that wants to say "these are the names" should not
+/// hand-copy the list.
+extern const char* const KEY_FILE_NAMES[5];
 
 /// Point every Common::FS::EdenPath at a writable root and create the directories.
 ///
@@ -147,6 +326,9 @@ const std::filesystem::path& AppliedRoot();
 /// Copy key files out of <root>/keys_import into Eden's key directory, then reload the
 /// KeyManager. Calls SetupUserPaths() first, so it can never disagree with it about
 /// where the data root is.
+///
+/// This is the Files.app route: the user drops a file into keys_import and it is
+/// adopted at the next load. InstallKeysFrom() is the in-app route and is immediate.
 void AdoptKeys();
 
 /// !Core::Crypto::KeyManager::Instance().BaseDeriveNecessary() (key_manager.h:285).
@@ -156,27 +338,74 @@ bool KeysPresent();
 /// Resolve the user-facing directories. Cheap; touches no disk.
 Paths GetPaths();
 
+/// Install key files from a user-provided file or folder, immediately.
+///
+/// `source` may be a single file named prod.keys, dev.keys, title.keys, console.keys or
+/// key_retail.bin - matched CASE-INSENSITIVELY, and written under the lowercase name
+/// Eden actually opens, because KeyManager::ReloadKeys opens exact lowercase names and
+/// a "Prod.keys" off a Mac would otherwise be silently invisible - or a folder, which is
+/// searched recursively for those names.
+///
+/// Writes into the keys directory and calls ReloadKeys(), so the result is visible in
+/// the very next Describe(). Never touches anything outside the keys directory, and
+/// never removes a key file it did not just replace.
+KeyInstallReport InstallKeysFrom(const std::filesystem::path& source);
+
+/// Install firmware from a user-provided ZIP archive or folder.
+///
+/// A .zip is read and decompressed in-process (stored and deflate entries; every entry
+/// verified against the CRC-32 in its own central-directory record). A folder is walked
+/// recursively. In both cases only entries whose FILE NAME matches the NCA-id format
+/// are installed, and the directory structure is flattened - which is what the
+/// RegisteredCache wants, since it scans one flat directory plus "000000XX" buckets.
+///
+/// `replace_existing` removes the NCAs already in the firmware directory first. Prefer
+/// true for a complete firmware archive: two firmware versions mixed in one directory
+/// is a state nothing here can reason about. It only ever deletes inside the app's own
+/// firmware directory, and only files whose names match the NCA-id format.
+///
+/// Takes effect at the NEXT game load - FileSystemController::CreateFactories builds the
+/// RegisteredCache during the load and reads the directory then.
+FirmwareInstallReport InstallFirmwareFrom(const std::filesystem::path& source,
+                                          bool replace_existing);
+
 /// Count firmware NCAs sitting in <NANDDir>/system/Contents/registered.
 ///
 /// A filesystem scan, deliberately: it needs no Core::System, no keys and no
 /// RegisteredCache, so it answers at app launch, before anything is loaded. It counts
-/// *names*, so it cannot tell a valid NCA from a corrupt one - see
-/// FirmwareRegistered() for the check that actually parses.
+/// *names*, so it cannot tell a valid NCA from a corrupt one - see VerifyFirmware()
+/// for the check that actually parses.
 std::size_t CountFirmwareNcas();
 
 /// CountFirmwareNcas() != 0.
 bool FirmwarePresent();
 
-/// The strict firmware check, equivalent to FirmwareManager::CheckFirmwarePresence
+/// Parse the installed firmware and read its system version. EXPENSIVE.
+///
+/// Builds a FileSys::RegisteredCache over the firmware directory - which parses the
+/// header of every NCA in it, using the KeyManager keyring - then reads the
+/// SystemVersion system-data title (0x0100000000000809), extracts its RomFS and decodes
+/// the 0x100-byte version record. Needs no Core::System, so it works before the first
+/// load, which is the entire point.
+///
+/// Deliberately does NOT use Service::Set::GetFirmwareVersionImpl: that function falls
+/// back to SystemArchive::SynthesizeSystemArchive (system_settings_server.cpp:83-86),
+/// which returns the hardcoded api_version.h constants, so it reports a firmware
+/// version on a machine with none installed. Here, unknown stays unknown.
+///
+/// HONEST LIMIT: this parses real NCA headers through FileSys::NCA, and this port has
+/// never executed that against a real firmware dump on a device. A Good verdict is a
+/// strong signal; an Unreadable one should be read as "could not confirm", not as proof
+/// the user's firmware is bad.
+FirmwareReport VerifyFirmware();
+
+/// The strict presence check, equivalent to FirmwareManager::CheckFirmwarePresence
 /// (frontend_common/firmware_manager.h:66-82) but without linking frontend_common:
 /// asks the system NAND RegisteredCache for the Mii Edit applet's program NCA.
 ///
 /// Requires that FileSystemController::CreateFactories() has already run on this
-/// system and that keys are loaded, because the cache parses NCA headers to build its
-/// index. Returns false, rather than failing, when the factories do not exist yet.
-/// It does go through FileSys::NCA parsing, which this port has never executed on a
-/// real firmware dump, so treat a false from it as "could not confirm", not as proof.
-/// Use this after a load; use CountFirmwareNcas() before one.
+/// system, i.e. a game is loaded. Returns false, rather than failing, when the
+/// factories do not exist yet. Use VerifyFirmware() before a load and this one after.
 bool FirmwareRegistered(Core::System& system);
 
 /// Full pre-load status. Runs the disk checks every time it is called; there is no
@@ -186,10 +415,25 @@ bool FirmwareRegistered(Core::System& system);
 /// paths Eden will use, even if it is called before retro_init), which creates the data
 /// directories; and when a key file is on disk but the keyring is unusable it reloads
 /// the KeyManager once, so a key dropped in through Files.app is picked up.
-Report Describe();
+///
+/// `verify_firmware` additionally runs VerifyFirmware(), which is the only way to reach
+/// FirmwareUnreadable or FirmwareWrongVersion. It is off by default because parsing a
+/// full firmware set is seconds of work and a UI that polls this would stutter.
+Report Describe(bool verify_firmware = false);
+
+/// The same report, folding in a firmware verification you ALREADY ran, without paying
+/// for it again.
+///
+/// This exists so a frontend can keep showing "firmware 19.0.1, newer than this build"
+/// on every subsequent cheap refresh instead of silently reverting to Ready - a status
+/// line and a firmware row that contradict each other is worse than either alone. Only
+/// a Ready report is changed: a report that already says NoKeys or BadKeys names a
+/// problem that has to be fixed before the firmware question means anything.
+Report DescribeUsing(const FirmwareReport& verified);
 
 /// Stable, lowercase, machine-readable token for a status: "no_data_root", "no_keys",
-/// "bad_keys", "no_firmware", "ready". Meant for a frontend to switch on. Never null.
+/// "bad_keys", "no_firmware", "firmware_unreadable", "firmware_wrong_version", "ready".
+/// Meant for a frontend to switch on. Never null.
 const char* StatusToken(Status status);
 
 /// One or two sentences a human can act on, naming the real path the file must go to.

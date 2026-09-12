@@ -1,0 +1,796 @@
+name: Build JIT probe IPA
+
+# The probe is only worth anything once it is on a device, and it can only get onto a
+# device as an IPA. Until this workflow existed, src/ios/JITProbe answered nothing: its
+# own README says so - "This has never been through xcodebuild ... Adding a CI job is a
+# change to .github/workflows/, which this directory does not own."
+#
+# WHAT THIS BUILDS, AND WHAT IT DELIBERATELY DOES NOT
+# --------------------------------------------------
+# Two Swift files and one C file. No CMake, no CPM cache, no MoltenVK, no ~60 static
+# archives, no submodules. build-ios-app.yml needs all of that and takes hours; this job
+# takes minutes, which is the entire point: docs/IOS_PORT_NOTES.md lists under
+# "Unverified" whether mprotect(PROT_READ|PROT_EXEC) actually succeeds on a device, and
+# every milestone in README.md is conditional on that one line. An answer that arrives
+# after the core builds is an answer that arrives too late to change anything.
+#
+# The independence is enforced here, not assumed - see the two gates named "Independence
+# gate". If somebody ever links the core into the probe, this job fails rather than
+# quietly becoming another thing that has to build first.
+#
+# WHY NOT ci/verify-ipa.sh
+# ------------------------
+# That script is Eden's IPA gate and it is right for Eden, but check 9b
+# (ci/verify-ipa.sh:153-176) FAILS any bundle that does not define _retro_init,
+# _retro_run, _retro_load_game and _eden_libretro_set_metal_layer. The probe must define
+# none of them. Running it here would assert the exact opposite of this lane's
+# requirement, so the structural checks are reimplemented below - including the inverse
+# of 9b, which fails if those symbols ARE present.
+#
+# WHAT A GREEN RUN MEANS
+# ----------------------
+# That the probe compiles, packages and is structurally installable. Nothing about JIT.
+# CI cannot answer the JIT question - no runner can - because the answer depends on the
+# device, the iOS version, how the IPA was re-signed and which launcher started it. This
+# workflow's whole job is to get the question in front of a device.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: >-
+          Publish the IPAs as a GitHub Release under this tag (e.g. jit-probe-v1).
+          Leave empty to only upload artifacts. A Release exists because the device
+          doing the installing usually is not signed in to GitHub, and an Actions
+          artifact requires a login; a Release asset does not.
+        required: false
+        default: ''
+  push:
+    # No branch filter on purpose. Several lanes work on this checkout at once, and a
+    # probe change on any branch should produce an installable build. The path filter is
+    # what keeps this job off every unrelated push - it is the only reason an unfiltered
+    # branch list is affordable here.
+    paths:
+      - 'src/ios/JITProbe/**'
+      - '.github/workflows/build-jit-probe.yml'
+
+concurrency:
+  group: build-jit-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The contract with src/ios/JITProbe/project.yml. If any of these change there,
+  # change them here - and grep this file for the product name, which also appears
+  # spelled out in the release file list so that a missing IPA is visible in the diff.
+  XCODE_PROJECT: JITProbe.xcodeproj
+  SCHEME: JITProbe
+  APP_NAME: JITProbe
+  BASE_BUNDLE_ID: dev.edenios.JITProbe
+  PROBE_DIR: src/ios/JITProbe
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: write # the release step at the bottom, and nothing else
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          # NO SUBMODULES. The probe includes nothing but system headers
+          # (src/ios/JITProbe/Probe/jit_probe.c:9-33), so externals/ would be several
+          # gigabytes of download that cannot affect the output. It is also a gate of
+          # sorts: if the probe ever grows a dependency on a submodule, this job fails
+          # to build instead of silently acquiring one.
+          submodules: false
+
+      - name: Environment
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          sw_vers
+          df -h / | tail -1
+
+      - name: Install XcodeGen
+        run: |
+          if command -v xcodegen >/dev/null 2>&1; then
+            echo "xcodegen already present"
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install xcodegen
+          fi
+          xcodegen --version
+
+      # ---------------------------------------------------------------------------
+      # Independence gate 1: the sources
+      # ---------------------------------------------------------------------------
+      # Cheap, and it runs before Xcode is even started so a coupling mistake costs
+      # seconds rather than a build. The binary-level gate further down is the
+      # authoritative one; this one exists to fail fast and to say plainly what the rule
+      # is.
+      - name: Independence gate (sources)
+        run: |
+          set -euo pipefail
+          cd "$PROBE_DIR"
+          RC=0
+
+          # Every quoted #include in the probe must resolve inside this directory. The
+          # only one that exists today is jit_probe.h.
+          echo "--- quoted includes ---"
+          BAD_INCLUDES="$(grep -rhoE '#(include|import)[[:space:]]*"[^"]+"' Probe App ./*.h \
+            | sed -E 's/.*"([^"]+)".*/\1/' | sort -u | grep -v '^jit_probe\.h$' || true)"
+          if [ -n "$BAD_INCLUDES" ]; then
+            echo "::error::the probe includes headers from outside its own directory:"
+            echo "$BAD_INCLUDES"
+            RC=1
+          else
+            echo "  ok    only jit_probe.h"
+          fi
+
+          # project.yml must not acquire the coupling machinery src/ios/project.yml
+          # needs. Full-line comments are stripped first because that file explains at
+          # length which of these it deliberately does NOT have, and the explanation
+          # must not trip the check that enforces it.
+          echo "--- project.yml coupling ---"
+          STRIPPED="$(sed -E 's/^[[:space:]]*#.*$//' project.yml)"
+          for pattern in 'preBuildScript' 'postBuildScript' 'OTHER_LDFLAGS' \
+                         'LIBRARY_SEARCH_PATHS' 'link-flags' '\.a\b' '\.\./' 'MoltenVK'; do
+            if echo "$STRIPPED" | grep -qE "$pattern"; then
+              echo "::error::project.yml now references '$pattern' - the probe is no longer standalone"
+              echo "$STRIPPED" | grep -nE "$pattern"
+              RC=1
+            fi
+          done
+          if [ "$RC" = 0 ]; then
+            echo "  ok    no link flags, no scripts, no paths outside the directory"
+          fi
+
+          exit $RC
+
+      - name: Generate the Xcode project
+        run: |
+          set -euo pipefail
+          cd "$PROBE_DIR"
+          xcodegen generate
+          ls -la "$XCODE_PROJECT"
+
+      # -derivedDataPath AND SYMROOT/OBJROOT, so the product path is the same string
+      # whether the build runs by scheme or by target - hunting for the .app under
+      # ~/Library/Developer/Xcode/DerivedData is how a workflow ships last run's binary.
+      #
+      # CODE_SIGNING_ALLOWED=NO: there is no certificate on a runner, and signing is not
+      # wanted here anyway. Entitlements only exist inside a signature, and this job
+      # applies four different sets of them to one .app afterwards.
+      - name: Build the probe
+        run: |
+          set -euo pipefail
+          cd "$PROBE_DIR"
+          DERIVED="$GITHUB_WORKSPACE/derived"
+
+          echo "--- xcodebuild -list ---"
+          xcodebuild -project "$XCODE_PROJECT" -list || true
+
+          # XcodeGen generates a scheme because project.yml declares one on the target,
+          # but a scheme is a generated convenience and a target is a fact. If the
+          # scheme is ever missing, build the target directly rather than failing.
+          if xcodebuild -project "$XCODE_PROJECT" -list 2>/dev/null \
+             | awk '/Schemes:/{f=1;next} f&&NF{print $1}' | grep -qx "$SCHEME"; then
+            SELECTOR=(-scheme "$SCHEME")
+          else
+            echo "::warning::no '$SCHEME' scheme in the generated project; building the target directly"
+            SELECTOR=(-target "$APP_NAME")
+          fi
+
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            "${SELECTOR[@]}" \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath "$DERIVED" \
+            SYMROOT="$DERIVED/Build/Products" \
+            OBJROOT="$DERIVED/Build/Intermediates.noindex" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee "$GITHUB_WORKSPACE/xcodebuild.log"
+
+      # ---------------------------------------------------------------------------
+      # Independence gate 2: the binary
+      # ---------------------------------------------------------------------------
+      # This is the one that actually proves it. A source-level grep can be satisfied
+      # while the linker pulls in half the emulator; otool cannot.
+      - name: Locate the product and gate it
+        id: product
+        run: |
+          set -euo pipefail
+          APP="$GITHUB_WORKSPACE/derived/Build/Products/Release-iphoneos/$APP_NAME.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::no $APP_NAME.app at $APP"
+            find "$GITHUB_WORKSPACE/derived/Build/Products" -maxdepth 4 -name '*.app' || true
+            exit 1
+          fi
+          BIN="$APP/$APP_NAME"
+          [ -f "$BIN" ] || { echo "::error::no executable at $BIN"; ls -la "$APP"; exit 1; }
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+          ls -la "$APP"
+          RC=0
+
+          # --- architecture -------------------------------------------------------
+          # src/ios/JITProbe/project.yml pins ARCHS to arm64 and says why: jit_probe.c
+          # manufactures a function pointer into memory it wrote and calls it, and on
+          # arm64e that pointer would need a PAC signature. An unsigned one faults for
+          # reasons that have nothing to do with JIT permission, which would make the
+          # app answer the wrong question convincingly. So arm64, exactly, and nothing
+          # else in the binary.
+          ARCHS="$(lipo -archs "$BIN" 2>&1 | tr -s ' ' || true)"
+          echo "--- architectures: $ARCHS ---"
+          if [ "$ARCHS" = "arm64" ]; then
+            echo "  ok    arm64 only"
+          else
+            echo "::error::expected exactly 'arm64', got '$ARCHS' - arm64e would make the probe lie (see project.yml ARCHS)"
+            RC=1
+          fi
+
+          # --- shared libraries ---------------------------------------------------
+          echo "--- otool -L ---"
+          otool -L "$BIN"
+          DEPS="$(otool -L "$BIN" | tail -n +2 | awk '{print $1}' || true)"
+          for dep in $DEPS; do
+            case "$dep" in
+              /usr/lib/*|/System/Library/*) ;;
+              @rpath/libswift*)
+                echo "::warning::$dep is embedded rather than taken from the OS - not a core dependency, but unexpected for a Swift 5 app targeting iOS 15"
+                ;;
+              *)
+                echo "::error::non-system dependency: $dep"
+                RC=1
+                ;;
+            esac
+          done
+          if echo "$DEPS" | grep -qiE 'eden|libretro|dynarmic|moltenvk|vulkan|SDL'; then
+            echo "::error::the probe links part of the emulator. It must link none of it."
+            RC=1
+          fi
+
+          # --- the inverse of ci/verify-ipa.sh check 9b ---------------------------
+          # That script fails Eden's IPA when these symbols are ABSENT. Here they must
+          # be absent: their presence means the core was linked in and the probe is no
+          # longer a thing that can be built before the core works.
+          echo "--- core entry points must NOT be defined ---"
+          for sym in _retro_init _retro_run _retro_load_game _eden_libretro_set_metal_layer; do
+            if nm -g --defined-only "$BIN" 2>/dev/null | grep -q " $sym\$"; then
+              echo "::error::$sym is defined in the probe binary - the core got linked in"
+              RC=1
+            fi
+          done
+          if [ "$RC" = 0 ]; then
+            echo "  ok    none of the core entry points are present"
+          fi
+
+          # --- nothing embedded ---------------------------------------------------
+          if [ -d "$APP/Frameworks" ]; then
+            echo "::warning::the bundle has a Frameworks/ directory:"
+            ls -la "$APP/Frameworks"
+            if ls "$APP/Frameworks" | grep -qiE 'eden|libretro|vulkan|moltenvk'; then
+              echo "::error::emulator libraries embedded in the probe bundle"
+              RC=1
+            fi
+          else
+            echo "  ok    no embedded frameworks"
+          fi
+
+          # --- size ---------------------------------------------------------------
+          # Two Swift files and one C file, with symbols kept (project.yml sets
+          # STRIP_INSTALLED_PRODUCT: NO deliberately, so a tester's crash report can be
+          # symbolicated). A few MB. If this ever reads 200 MB, something enormous was
+          # linked in and every check above somehow missed it.
+          SIZE_KB="$(du -sk "$APP" | cut -f1)"
+          echo "--- bundle size: ${SIZE_KB} KB ---"
+          if [ "$SIZE_KB" -gt 40960 ]; then
+            echo "::error::bundle is ${SIZE_KB} KB (>40 MB). A standalone probe cannot be this big."
+            RC=1
+          fi
+
+          exit $RC
+
+      # Helpers are written to a file rather than inlined as heredocs inside shell
+      # functions further down, because a heredoc nested inside an indented function
+      # inside a YAML block scalar is a reliable way to ship a broken workflow.
+      - name: Write the verification helpers
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/check-entitlements.py" <<'PY'
+          # argv: variant expected.plist|- embedded.xml binary
+          #
+          # Two separate questions, both of which have burned this project's sibling:
+          #   1. did the keys we asked for actually reach the signature
+          #   2. did they reach it in DER form
+          # iOS 15+ reads a signature carrying only the XML blob as declaring NO
+          # entitlements, while `codesign -d --entitlements` still prints the XML back
+          # happily. So question 1 answered alone is not evidence.
+          import os
+          import plistlib
+          import sys
+
+          variant, expected_path, embedded_path, binary_path = sys.argv[1:5]
+          failures = []
+          notes = []
+
+          expected = {}
+          if expected_path != '-':
+              with open(expected_path, 'rb') as handle:
+                  expected = plistlib.load(handle)
+
+          raw = b''
+          if os.path.exists(embedded_path):
+              with open(embedded_path, 'rb') as handle:
+                  raw = handle.read()
+
+          embedded = {}
+          start = raw.find(b'<?xml')
+          if start >= 0:
+              try:
+                  embedded = plistlib.loads(raw[start:])
+              except Exception as exc:  # noqa: BLE001 - the message is the point
+                  failures.append('could not parse the embedded entitlements: %s' % exc)
+
+          print('variant %s' % variant)
+          print('  expected keys: %s' % (sorted(expected) or '(none)'))
+          print('  embedded keys: %s' % (sorted(embedded) or '(none)'))
+
+          for key, value in expected.items():
+              if key not in embedded:
+                  failures.append('%s is missing from the signature' % key)
+              elif embedded[key] != value:
+                  failures.append('%s is %r in the signature, expected %r'
+                                  % (key, embedded[key], value))
+
+          # The control variant's whole purpose is to be signed and ask for nothing. If
+          # it carries any of the three keys that could grant executable memory, it is
+          # not a control and the comparison it exists to support is worthless.
+          if not expected:
+              for key in ('get-task-allow', 'dynamic-codesigning',
+                          'com.apple.security.cs.allow-jit'):
+                  if embedded.get(key):
+                      failures.append('the control variant carries %s - it is not a control' % key)
+
+          # DER, checked by looking for the blob magic in the binary itself.
+          # CSMAGIC_EMBEDDED_ENTITLEMENTS = 0xfade7171 (XML), and
+          # CSMAGIC_EMBEDDED_DER_ENTITLEMENTS = 0xfade7172 (DER).
+          #
+          # ci/verify-ipa.sh flags this constant as unverified and therefore only
+          # reports it. This does better without risking a false failure: the XML magic
+          # is used as a positive control for the search itself. Finding XML but not DER
+          # is a real, specific failure and fails the build. Finding neither means the
+          # search method is wrong, not that the signature is - so that only warns.
+          with open(binary_path, 'rb') as handle:
+              blob = handle.read()
+          has_xml = b'\xfa\xde\x71\x71' in blob
+          has_der = b'\xfa\xde\x71\x72' in blob
+          if expected:
+              if has_der:
+                  print('  ok    DER entitlement blob present')
+              elif has_xml:
+                  failures.append('XML entitlements are embedded but the DER blob is not - '
+                                  'iOS 15+ will read this binary as having no entitlements. '
+                                  'codesign needs --generate-entitlement-der.')
+              else:
+                  notes.append('found neither entitlement blob magic in the binary; the '
+                               'byte search could not confirm or deny DER. Not failing on it.')
+
+          for note in notes:
+              print('::warning::%s: %s' % (variant, note))
+          for failure in failures:
+              print('::error::%s: %s' % (variant, failure))
+          sys.exit(1 if failures else 0)
+          PY
+
+          # The structural checks below read the bundle as files. This asks CFBundle
+          # whether it agrees the thing is loadable, which is the question that matters
+          # on device - and the only check that catches a bundle whose files are all
+          # correct but which CFBundle refuses. Lifted from ci/verify-ipa.sh:283-300,
+          # which is there because the sibling project shipped two releases with exactly
+          # that failure.
+          cat > "$RUNNER_TEMP/bundle-probe.m" <<'PROBE'
+          #import <Foundation/Foundation.h>
+          int main(int argc, const char **argv) {
+              @autoreleasepool {
+                  if (argc < 2) { return 2; }
+                  NSBundle *b = [NSBundle bundleWithPath:[NSString stringWithUTF8String:argv[1]]];
+                  if (b == nil) { fprintf(stderr, "NSBundle refused the path\n"); return 1; }
+                  NSString *ident = [b bundleIdentifier];
+                  if (ident == nil) { fprintf(stderr, "no bundle identifier\n"); return 1; }
+                  fprintf(stdout, "%s\n", [ident UTF8String]);
+                  return 0;
+              }
+          }
+          PROBE
+          clang -framework Foundation -o "$RUNNER_TEMP/bundle-probe" "$RUNNER_TEMP/bundle-probe.m" \
+            || echo "::warning::could not build the NSBundle probe on this host; that check will be skipped"
+
+      # ---------------------------------------------------------------------------
+      # Four IPAs from one .app
+      # ---------------------------------------------------------------------------
+      # The variants differ ONLY in their signature, so they are re-signs of a single
+      # build rather than four builds - the same shape build-ios-app.yml uses for Eden.
+      #
+      # WHY EACH VARIANT GETS ITS OWN BUNDLE IDENTIFIER
+      # -----------------------------------------------
+      # This is not cosmetic and it is not copied from Eden's workflow, which does not
+      # do it. jit_probe.c:172 writes per-strategy outcomes to jit-probe-results.txt in
+      # Documents, and jp_begin() loads that file on every launch (jit_probe.c:1104). A
+      # container is keyed by bundle identifier. With one identifier for all four
+      # variants, installing the second one over the first inherits the first's results
+      # file and reports another variant's outcomes as its own - and README.md asks the
+      # tester to run every variant they were given. The experiment would quietly
+      # measure the wrong thing.
+      #
+      # Distinct identifiers also let all four sit on the home screen at once, which is
+      # what "run each one and send all of the reports" actually requires. Nothing in
+      # the probe reads its own bundle identifier, and none of the entitlements are
+      # identifier-scoped, so changing it costs nothing.
+      #
+      # CFBundleDisplayName is stamped short for the reason recorded in
+      # cemu-ios-muffin/.github/workflows/build-ios-app.yml: an icon caption gets a
+      # handful of characters, and every build looking identical in the installer is a
+      # real problem a tester reported.
+      - name: Package four IPAs
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          APP="${{ steps.product.outputs.app }}"
+          SHA7="$(echo "$GITHUB_SHA" | cut -c1-7)"
+
+          # A numeric CFBundleShortVersionString, because installers are picky and a tag
+          # is not always numeric. The tag stays the unambiguous identifier; this is
+          # only what gets displayed.
+          if [ -n "${RELEASE_TAG:-}" ] && echo "$RELEASE_TAG" | grep -qE '^v?[0-9]+(\.[0-9]+){0,2}'; then
+            VER="$(echo "$RELEASE_TAG" | sed -nE 's/^v?([0-9]+(\.[0-9]+){0,2}).*/\1/p')"
+          else
+            VER="0.1.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version $VER, build $GITHUB_RUN_NUMBER, commit $SHA7"
+
+          pb() { /usr/libexec/PlistBuddy "$@"; }
+          set_or_add() { # plist key type value
+            pb -c "Set :$2 $4" "$1" 2>/dev/null || pb -c "Add :$2 $3 $4" "$1"
+          }
+
+          package() {
+            VARIANT="$1"; ENTS="$2"; ID_SUFFIX="$3"; LABEL="$4"
+            STAGE="$GITHUB_WORKSPACE/stage-$VARIANT"
+            OUT="$GITHUB_WORKSPACE/$APP_NAME-$VARIANT.ipa"
+            STAGED="$STAGE/Payload/$APP_NAME.app"
+
+            rm -rf "$STAGE" "$OUT"
+            mkdir -p "$STAGE/Payload"
+            cp -R "$APP" "$STAGE/Payload/"
+
+            # Stamp BEFORE signing. The signature covers Info.plist, so stamping
+            # afterwards invalidates it.
+            PL="$STAGED/Info.plist"
+            set_or_add "$PL" CFBundleIdentifier          string "${BASE_BUNDLE_ID}${ID_SUFFIX}"
+            set_or_add "$PL" CFBundleDisplayName         string "$LABEL"
+            set_or_add "$PL" CFBundleShortVersionString  string "$VER"
+            set_or_add "$PL" CFBundleVersion             string "$GITHUB_RUN_NUMBER"
+            # Not shown anywhere in the app - the probe's report has no build-identity
+            # field to print it in (see the job summary). It is here so that an IPA sent
+            # back to us can be identified from its own Info.plist.
+            set_or_add "$PL" EdenJITProbeBuild           string "$SHA7 $VARIANT run$GITHUB_RUN_NUMBER"
+
+            if [ -n "$ENTS" ]; then
+              # --generate-entitlement-der is MANDATORY on iOS 15+: a signature carrying
+              # only the XML blob is read as declaring no entitlements at all, which
+              # would make the trollstore variant behave exactly like the control while
+              # looking exactly like the JIT one. That confusion is the specific thing
+              # this workflow exists to prevent, so it is verified below rather than
+              # trusted.
+              codesign --force --sign - \
+                --entitlements "$GITHUB_WORKSPACE/$PROBE_DIR/$ENTS" \
+                --generate-entitlement-der \
+                --timestamp=none \
+                "$STAGED"
+              EXPECTED="$GITHUB_WORKSPACE/$PROBE_DIR/$ENTS"
+            else
+              # Not signed here at all. Note that the linker may still have applied its
+              # own ad-hoc signature; either way it carries no entitlements, and
+              # SideStore/AltStore replace whatever is there when they install.
+              EXPECTED="-"
+            fi
+
+            EMB="$STAGE/embedded-entitlements.xml"
+            codesign -d --entitlements :- --xml "$STAGED" > "$EMB" 2>/dev/null \
+              || codesign -d --entitlements :- "$STAGED" > "$EMB" 2>/dev/null \
+              || : > "$EMB"
+            python3 "$RUNNER_TEMP/check-entitlements.py" \
+              "$VARIANT" "$EXPECTED" "$EMB" "$STAGED/$APP_NAME"
+
+            ( cd "$STAGE" && zip -qry "$OUT" Payload )
+            echo "packed $OUT ($(du -h "$OUT" | cut -f1))"
+          }
+
+          #         variant      entitlements                      id suffix     label
+          package  "unsigned"   ""                                 ""            "JIT Probe"
+          package  "sideload"   "JITProbe.entitlements"            ".sideload"   "Probe SL"
+          package  "trollstore" "JITProbe-TrollStore.entitlements" ".trollstore" "Probe TS"
+          package  "none"       "JITProbe-None.entitlements"       ".none"       "Probe NONE"
+
+          # NOT PACKAGED: a "debug" variant. JITProbe-Debug.entitlements declares the
+          # same three keys as JITProbe.entitlements, so an ad-hoc re-sign of this
+          # Release binary with it would be byte-for-byte the sideload variant under
+          # another name - four IPAs where three carry information. The Debug
+          # CONFIGURATION is a different thing (-Onone, DEBUG defined) and would be a
+          # second xcodebuild; if it is ever wanted, add it as a build, not as a re-sign.
+
+      # BEFORE any upload. A gate that runs after publication is not a gate.
+      - name: Verify every IPA
+        run: |
+          set -euo pipefail
+          WORKROOT="$RUNNER_TEMP/verify"
+          rm -rf "$WORKROOT"; mkdir -p "$WORKROOT"
+          RC=0
+
+          check() {
+            IPA="$1"
+            echo ""
+            echo "=== $(basename "$IPA") ==="
+            W="$WORKROOT/$(basename "$IPA" .ipa)"
+            mkdir -p "$W"
+            unzip -qq "$IPA" -d "$W" || { echo "::error::$IPA does not unzip"; RC=1; return; }
+
+            [ -d "$W/Payload" ] || { echo "::error::no top-level Payload/ directory"; RC=1; return; }
+            # Every command substitution below is guarded. set -e kills the whole job
+            # when an assignment's substitution fails, and `find | head -1` can fail on
+            # SIGPIPE alone - which would end the run silently after one bad IPA instead
+            # of reporting all four.
+            COUNT="$(find "$W/Payload" -maxdepth 1 -name '*.app' | wc -l | tr -d ' ' || true)"
+            [ "$COUNT" = "1" ] || { echo "::error::expected one .app in Payload/, found $COUNT"; RC=1; return; }
+            A="$(find "$W/Payload" -maxdepth 1 -name '*.app' | head -1 || true)"
+
+            # iOS refuses to install a bundle containing symlinks.
+            LINKS="$(find "$A" -type l | wc -l | tr -d ' ' || true)"
+            [ "$LINKS" = "0" ] || { echo "::error::$LINKS symlink(s) in the bundle"; RC=1; }
+
+            # The device filesystem is case-sensitive; the runner's is not, so two names
+            # differing only in case survive packaging and collide on install.
+            DUPES="$(find "$A" | tr 'A-Z' 'a-z' | sort | uniq -d | wc -l | tr -d ' ' || true)"
+            [ "$DUPES" = "0" ] || { echo "::error::$DUPES case-insensitive filename collision(s)"; RC=1; }
+
+            PL="$A/Info.plist"
+            [ -f "$PL" ] || { echo "::error::no Info.plist"; RC=1; return; }
+
+            EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PL" 2>/dev/null || true)"
+            BIN=""
+            if [ -z "$EXEC" ] || [ ! -f "$A/$EXEC" ]; then
+              echo "::error::CFBundleExecutable is '$EXEC' and does not name a real file"
+              RC=1
+            else
+              BIN="$A/$EXEC"
+              if [ ! -x "$BIN" ]; then
+                echo "::error::$EXEC is not executable - zip did not preserve the mode"
+                RC=1
+              fi
+            fi
+
+            # Build settings must have been expanded. An Info.plist still containing
+            # $(PRODUCT_NAME) installs as an app with no identity.
+            for key in CFBundleIdentifier CFBundleExecutable CFBundleName \
+                       CFBundleShortVersionString CFBundleVersion; do
+              V="$(/usr/libexec/PlistBuddy -c "Print :$key" "$PL" 2>/dev/null || true)"
+              case "$V" in
+                ''|*'$('*) echo "::error::$key is '$V' - empty or an unexpanded build setting"; RC=1 ;;
+                *)         echo "  ok    $key = $V" ;;
+              esac
+            done
+
+            # CMakeModules/toolchains/iOS.cmake pins the floor at 15.0 to keep older
+            # hardware in scope, and project.yml matches it. A probe that will not
+            # install on an older device cannot answer the question for that device -
+            # which is precisely the device whose answer is least predictable.
+            MIN="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$PL" 2>/dev/null || true)"
+            [ "$MIN" = "15.0" ] || { echo "::error::MinimumOSVersion is '$MIN', expected 15.0"; RC=1; }
+
+            # Load-bearing here, not boilerplate: the report and the crash journal leave
+            # the device through Files.app when the app will not stay open long enough
+            # to read the screen, and that is exactly the case where the answer matters
+            # most. xcodebuild's GENERATE_INFOPLIST_FILE merge is known on this project
+            # to drop UIFileSharingEnabled silently, which is why this is checked on the
+            # built artifact rather than on project.yml.
+            for key in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+              V="$(/usr/libexec/PlistBuddy -c "Print :$key" "$PL" 2>/dev/null || true)"
+              [ "$V" = "true" ] || { echo "::error::$key is '$V', expected true - the report cannot leave the device without it"; RC=1; }
+            done
+
+            FAM="$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily' "$PL" 2>/dev/null | tr -d ' ' | tr '\n' ' ' || true)"
+            if echo "$FAM" | grep -q 1 && echo "$FAM" | grep -q 2; then
+              echo "  ok    iPhone and iPad"
+            else
+              echo "::error::UIDeviceFamily does not cover both idioms: $FAM"
+              RC=1
+            fi
+
+            if [ -n "$BIN" ]; then
+              ARCHS="$(lipo -archs "$BIN" 2>&1 | tr -s ' ' || true)"
+              [ "$ARCHS" = "arm64" ] || { echo "::error::architectures '$ARCHS', expected exactly arm64"; RC=1; }
+            fi
+
+            # CFBundle's bundle-version probe tests for Contents/ and Resources/; a
+            # directory colliding case-insensitively with either is what cost the
+            # sibling project two releases. Frameworks/ and PlugIns/ are NOT part of
+            # that probe and are legitimate, so they are not on this list - the same
+            # correction ci/verify-ipa.sh:160-186 makes to cemu's version.
+            for name in Contents Resources "Support Files" MacOS SharedFrameworks SharedSupport Versions; do
+              if [ -e "$A/$name" ]; then
+                echo "::error::CFBundle-reserved name at the bundle root: $name"
+                RC=1
+              fi
+            done
+
+            if [ -x "$RUNNER_TEMP/bundle-probe" ]; then
+              if IDENT="$("$RUNNER_TEMP/bundle-probe" "$A" 2>&1)"; then
+                echo "  ok    CFBundle loads it (identifier: $IDENT)"
+              else
+                echo "::error::CFBundle refused the bundle: $IDENT"
+                RC=1
+              fi
+            fi
+          }
+
+          for ipa in "$GITHUB_WORKSPACE/$APP_NAME"-*.ipa; do check "$ipa"; done
+          echo ""
+          [ "$RC" = 0 ] && echo "all IPAs verified" || echo "::error::IPA verification failed"
+          exit $RC
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          shasum -a 256 ./*.ipa | sed 's|\./||' | tee SHA256SUMS.txt
+
+      - name: Collect the dSYM
+        # STRIP_INSTALLED_PRODUCT is NO in project.yml, so the shipped binary keeps its
+        # symbols and a crash report is readable without this. The dSYM is still worth
+        # keeping: the probe is an app that is EXPECTED to be killed mid-test on some
+        # devices, and a killed run is a result, not a bug - one we will want to read.
+        run: |
+          set -euo pipefail
+          DSYM="$(find "$GITHUB_WORKSPACE/derived/Build/Products" -maxdepth 3 -type d -name "$APP_NAME.app.dSYM" | head -1 || true)"
+          if [ -n "$DSYM" ]; then
+            ( cd "$(dirname "$DSYM")" && zip -qry "$GITHUB_WORKSPACE/$APP_NAME.app.dSYM.zip" "$(basename "$DSYM")" )
+            echo "packed $APP_NAME.app.dSYM.zip"
+          else
+            echo "::warning::no dSYM was produced (DEBUG_INFORMATION_FORMAT may not be dwarf-with-dsym); the binary keeps its symbols regardless"
+          fi
+
+      - name: Upload IPAs
+        uses: actions/upload-artifact@v4
+        with:
+          name: jit-probe-ipas
+          path: |
+            *.ipa
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload logs and dSYM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jit-probe-logs
+          path: |
+            xcodebuild.log
+            *.dSYM.zip
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Gate, not a report, and it runs before anything is published. The sibling
+      # project shipped a release whose tag named three commits' worth of fixes that
+      # were not in the binary, because the tag was created by hand while a build of an
+      # older commit was still running. A release that lies about its own contents is
+      # worse than no release, and this is a probe whose entire value is that its output
+      # can be trusted.
+      - name: Refuse to publish into a tag that names different code
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          EXISTING="$(git ls-remote origin "refs/tags/$RELEASE_TAG" | cut -f1 || true)"
+          if [ -z "$EXISTING" ]; then
+            echo "tag $RELEASE_TAG does not exist yet; it will be created at $GITHUB_SHA"
+            exit 0
+          fi
+          if [ "$EXISTING" != "$GITHUB_SHA" ]; then
+            echo "::error::tag $RELEASE_TAG points at $EXISTING but this build came from $GITHUB_SHA"
+            echo "::error::publishing would attach these IPAs to a tag that names different code"
+            exit 1
+          fi
+          echo "tag $RELEASE_TAG already points at this build"
+
+      - name: Publish GitHub Release
+        # Opt-in. Most runs of this job are verification runs; the artifacts above are
+        # the normal delivery path. A Release exists because the phone doing the
+        # installing is not signed in to GitHub and an Actions artifact cannot be
+        # downloaded without a login.
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: JIT probe ${{ inputs.release_tag }}
+          files: |
+            JITProbe-unsigned.ipa
+            JITProbe-sideload.ipa
+            JITProbe-trollstore.ipa
+            JITProbe-none.ipa
+            JITProbe.app.dSYM.zip
+            SHA256SUMS.txt
+          body: |
+            A tiny app that answers one question: **can this process write machine
+            instructions into memory and then run them?**
+
+            It links no part of Eden, needs no `prod.keys`, and cannot load a game.
+            Built from `${{ github.sha }}`.
+
+            ## Which file to install
+
+            | | Install it with | What it is |
+            |---|---|---|
+            | **`JITProbe-unsigned.ipa`** | SideStore / AltStore / LiveContainer | Start here. They re-sign with your own Apple ID at install, which replaces any signature this file has, so an unsigned build is the right input. |
+            | **`JITProbe-trollstore.ipa`** | TrollStore or jailbroken only | Ad-hoc signed with `get-task-allow`, `dynamic-codesigning` and `com.apple.security.cs.allow-jit` genuinely embedded (DER form, verified in CI). A SideStore re-sign would strip these. |
+            | `JITProbe-sideload.ipa` | TrollStore or jailbroken only | Same, minus `dynamic-codesigning`. |
+            | `JITProbe-none.ipa` | TrollStore or jailbroken only | The control: signed, asking for nothing. |
+
+            The three ad-hoc files exist so the answer can be attributed. If `none`
+            fails and `trollstore` passes, the entitlements are doing the work; if both
+            pass, they are not. Each has its own bundle identifier, so all four can be
+            installed side by side without one overwriting another's saved results.
+
+            ## What to do with it
+
+            Open it, wait a few seconds, read the one big word, tap **Copy the full
+            report**, and send the report back. **If the app closes by itself that is a
+            result, not a bug** - reopen it, it remembers where it got to. Say whether
+            you launched it through a JIT enabler (StikDebug, SideStore, LiveContainer),
+            because the same device answers differently either way.
+
+            ## What this build does not claim
+
+            That JIT works. Nothing in CI can establish that - it depends on the device,
+            the iOS version, how the IPA was re-signed and what launched it. That is why
+            this app exists and why it has to run on real hardware.
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## JIT probe"
+            echo ""
+            echo "Four IPAs from one \`.app\`, differing only in signature:"
+            echo "\`unsigned\` (SideStore/AltStore), \`trollstore\`, \`sideload\`, \`none\` (control)."
+            echo "Each carries its own bundle identifier so they do not overwrite one another's"
+            echo "\`jit-probe-results.txt\`."
+            echo ""
+            echo "### What a green run here means"
+            echo "The probe compiles, links nothing from the emulator, and packages into"
+            echo "structurally sound bundles whose entitlements are verifiably embedded in DER form."
+            echo ""
+            echo "### What it does not mean"
+            echo "Anything at all about whether JIT works. No runner can answer that - the answer"
+            echo "depends on the device, the iOS version, the re-signing method and the launcher."
+            echo "Per \`docs/IOS_PORT_NOTES.md\` there is no interpreter, so that answer decides"
+            echo "whether the rest of the port is worth building."
+            echo ""
+            echo "### Known gap"
+            echo "The pasted report has no build-identity line. Variants are told apart by the"
+            echo "entitlements the report reads back from the kernel, and builds by the install"
+            echo "date - \`Info.plist\` carries \`EdenJITProbeBuild\` but nothing prints it. A"
+            echo "\`jp_set_build_id()\` alongside \`jp_set_os_version_hint()\` would close it."
+          } >> "$GITHUB_STEP_SUMMARY"

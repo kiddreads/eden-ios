@@ -32,17 +32,20 @@
 // sink_details.cpp and one in audio_core/CMakeLists.txt - and it leaks a "libretro"
 // entry into the desktop Qt audio dropdown that would be silence if anyone picked it.
 //
-// So this file supplies the sink and asks audio_core for one runtime hook instead:
+// So this file supplies the sink and audio_core grew one runtime hook instead, gated on
+// ENABLE_LIBRETRO so nothing changes for desktop or Android:
 //
 //     namespace AudioCore::Sink {
 //     using SinkFactoryFn = std::unique_ptr<Sink> (*)(std::string_view);
 //     void SetSinkOverride(SinkFactoryFn factory);   // nullptr clears
 //     }
 //
-// with CreateSinkFromID consulting it *before* GetOutputSinkDetails (which for
-// AudioEngine::Auto calls GetCubebLatency, and that opens a cubeb context - we do not
-// want a real device touched at all). Until that hook exists this file compiles,
-// links and behaves exactly as it did before: silence. See EDEN_LIBRETRO_SINK_HOOK.
+// CreateSinkFromID consults it *before* GetOutputSinkDetails (which for
+// AudioEngine::Auto calls GetCubebLatency, and that opens a cubeb context - no real
+// device is to be touched at all), and GetDeviceListForSink short-circuits for the same
+// reason. See src/audio_core/sink/sink_details.cpp.
+//
+// Init() installs the factory; from that point the emulator's audio comes out of Pump().
 //
 // FORMAT. No conversion anywhere on this path, and each half was read to confirm it:
 //   rate     48000 - AudioCore::TargetSampleRate (audio_core/common/common.h:70),
@@ -52,7 +55,7 @@
 //                    downmixes a 5.1 game to stereo with yuzu's coefficients
 //                    (sink_stream.cpp:37-61) before we ever see it.
 //   sample   s16 host-endian interleaved - what AppendBuffer pushes and what
-//                    retro_audio_sample_batch_t takes (libretro.h:7655-7670).
+//                    retro_audio_sample_batch_t takes (libretro.h:7670-7671).
 //   volume   already applied - AppendBuffer multiplies by
 //                    system_volume * device_volume * Settings::Volume()
 //                    (sink_stream.cpp:32-35). Do NOT apply it again here.
@@ -81,18 +84,18 @@
 // The three failure modes, and which are tolerated:
 //
 // UNDERRUN - Eden behind. ProcessAudioOutAndRender fills the shortfall by repeating
-//   last_frame (sink_stream.cpp:191-194) and counts only real frames into
+//   last_frame (sink_stream.cpp:189-194) and counts only real frames into
 //   actual_frames_written (:207, :220), so min/max_played_sample_count - and therefore
 //   DeviceSession::IsBufferConsumed - stay honest; the guest is never told it played
 //   audio it did not produce. Audible as a short DC hold.
-//   TOLERATED, and expected to be the COMMON case, not the exception: there is no JIT
-//   yet and nothing has ever run, so the emulator will sit below 100% speed and the
-//   guest will produce fewer than 800 frames per retro_run most of the time. Hiding
-//   this behind a resampler would also hide how far below realtime the core is.
+//   TOLERATED, and expected to be the COMMON case, not the exception: the emulator will
+//   sit below 100% speed on a phone and the guest will produce fewer than 800 frames per
+//   retro_run most of the time. Hiding this behind a resampler would also hide how far
+//   below realtime the core is.
 //
 // OVERRUN - Eden ahead, or Pump not called. Bounded by Eden itself: the renderer calls
-//   WaitFreeSpace before each command list (audio_renderer.cpp:198), whose predicate is
-//   `paused || queued_buffers < max_queue_size` (sink_stream.cpp:237-239) and which
+//   WaitFreeSpace before each command list (audio_renderer.cpp:197), whose predicate is
+//   `paused || queued_buffers < max_queue_size` (sink_stream.cpp:238) and which
 //   hard-blocks past max_queue_size + 3. Only ProcessAudioOutAndRender's
 //   release_cv.notify_one (:199) releases it. Two consequences, both load-bearing:
 //     - our stream MUST override Start/Stop. `paused` initialises to true
@@ -127,16 +130,24 @@
 
 #include "audio_core/common/common.h"
 #include "audio_core/sink/sink.h"
+#include "audio_core/sink/sink_details.h"
 #include "audio_core/sink/sink_stream.h"
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "libretro_core/retro_audio.h"
 
-#if defined(EDEN_LIBRETRO_SINK_HOOK)
-// Declares AudioCore::Sink::SetSinkOverride. See the header comment and the build note
-// at the bottom of this file.
-#include "audio_core/sink/sink_details.h"
-#endif
+namespace AudioCore::Sink {
+// Defined in src/audio_core/sink/sink_details.cpp under ENABLE_LIBRETRO, which is the
+// same condition under which this file is compiled at all (src/CMakeLists.txt:275-277
+// only adds libretro_core when ENABLE_LIBRETRO is set), so there is no configuration in
+// which this declaration resolves to nothing.
+//
+// Declared here rather than taken from sink_details.h because that header is outside
+// this change's lane. Spelled with the function type written out instead of the
+// SinkFactoryFn alias so the two declarations cannot drift; if the pair later moves into
+// sink_details.h, this becomes a redeclaration of the same function and both compile.
+void SetSinkOverride(std::unique_ptr<Sink> (*factory)(std::string_view));
+} // namespace AudioCore::Sink
 
 namespace LibretroCore::Audio {
 
@@ -169,7 +180,7 @@ constexpr s32 kSampleMax = static_cast<s32>((std::numeric_limits<s16>::max)());
 ///
 /// It deliberately overrides almost nothing. AppendBuffer stays the base version
 /// because that is what applies Settings::Volume(), downmixes 5.1 to stereo and fills
-/// the ring that the pull side drains (sink_stream.cpp:25-81) - suyu's override
+/// the ring that the pull side drains (sink_stream.cpp:25-101) - suyu's override
 /// (libretro_sink.h:78-88) throws all three away. Start/Stop are the exception, and
 /// they are not optional: see "OVERRUN" in the header comment.
 class LibretroSinkStream final : public SinkStream {
@@ -402,16 +413,19 @@ bool LibretroSink::MixInto(std::span<s32> accumulator, std::span<s16> scratch,
 // The hook overrides CreateSinkFromID, which builds the input sink as well as the
 // output one, so capture stops going to SDL. Nothing here records a microphone - iOS
 // capture needs its own session category and a usage description, neither of which
-// exists in this port yet.
+// exists in this port yet. sink_details.cpp's GetDeviceListForSink also reports an empty
+// capture device list while the override is installed, so a guest that asks first is
+// told there is no microphone rather than being handed one that only produces zeros.
 //
-// Handing the capture streams silence is still not the same as doing nothing.
-// SinkStream::AppendBuffer returns immediately for StreamType::In (sink_stream.cpp:26),
-// so an In stream's buffer bookkeeping advances only through ProcessAudioIn's counter
-// update (sink_stream.cpp:159-164), and DeviceSession::IsBufferConsumed compares
-// against exactly that (device_session.cpp:119-121, :134). Never calling it pins
-// played_sample_count at the constant GetExpectedPlayedSampleCount returns from zeroed
-// counters (TargetSampleCount * 5), and a game that opens the mic waits forever for its
-// first buffer back. Feeding zeros turns that hang into silence.
+// Handing the capture streams silence is still not the same as doing nothing, for the
+// guest that opens a session anyway. SinkStream::AppendBuffer returns immediately for
+// StreamType::In (sink_stream.cpp:26-27), so an In stream's buffer bookkeeping advances
+// only through ProcessAudioIn's counter update (sink_stream.cpp:159-164), and
+// DeviceSession::IsBufferConsumed compares against exactly that (device_session.cpp:
+// 119-121, :134). Never calling it pins played_sample_count at the constant
+// GetExpectedPlayedSampleCount returns from zeroed counters (TargetSampleCount * 5), and
+// a game that opens the mic waits forever for its first buffer back. Feeding zeros turns
+// that hang into silence.
 //
 // REASONED FROM THE SOURCE, NOT RUN. No title that opens an AudioIn session has been
 // tested here.
@@ -438,8 +452,8 @@ void LibretroSink::FeedInputSilence(std::span<const s16> silence, std::size_t fr
 }
 
 /// Drain `frames` frames out of Eden and append them to the staging FIFO, clamped to
-/// s16. Produces silence when no sink is installed, which is the pre-hook behaviour and
-/// also the between-titles behaviour.
+/// s16. Produces silence when no sink exists yet, which is the before-first-load and
+/// between-titles behaviour.
 void PullFrames(std::size_t frames) {
     if (frames == 0) {
         return;
@@ -491,14 +505,9 @@ void DropFrontFrames(std::size_t frames) {
     g_staging.erase(g_staging.begin(), g_staging.begin() + static_cast<std::ptrdiff_t>(samples));
 }
 
-} // namespace
-
-// Handed to audio_core as a plain function pointer. External linkage on purpose: as a
-// static it would be an unused function, and therefore -Werror=unused, in a build
-// without EDEN_LIBRETRO_SINK_HOOK. Declared before it is defined so the definition is
-// not a missing declaration either.
-std::unique_ptr<AudioCore::Sink::Sink> CreateLibretroSink(std::string_view device_id);
-
+/// Handed to audio_core as a plain function pointer by Init(). Internal linkage: the only
+/// thing that ever names it is SetSinkOverride's argument, and a hidden symbol is one
+/// fewer name in a static library that gets linked straight into the app binary.
 std::unique_ptr<AudioCore::Sink::Sink> CreateLibretroSink(std::string_view device_id) {
     auto sink = std::make_unique<LibretroSink>(device_id);
     {
@@ -509,6 +518,8 @@ std::unique_ptr<AudioCore::Sink::Sink> CreateLibretroSink(std::string_view devic
     return sink;
 }
 
+} // namespace
+
 void Init() {
     g_staging.clear();
     g_staging.reserve((kMaxStagingFrames + kFramesPerRun) * kChannels);
@@ -517,24 +528,15 @@ void Init() {
     g_silence.assign(kSamplesPerRun, s16{0});
     g_logged_live = false;
 
-#if defined(EDEN_LIBRETRO_SINK_HOOK)
     // Safe to do here even though retro_init has already called System::Initialize:
     // AudioCore, and with it CreateSinks, is constructed later, inside System::Load at
     // Impl::SetupForApplicationProcess (core.cpp:296).
     AudioCore::Sink::SetSinkOverride(&CreateLibretroSink);
     LOG_INFO(Audio_Sink, "libretro: audio sink override installed");
-#else
-    LOG_WARNING(Audio_Sink,
-                "libretro: built without EDEN_LIBRETRO_SINK_HOOK - AUDIO WILL BE SILENT. "
-                "audio_core needs Sink::SetSinkOverride and this target needs the matching "
-                "compile definition; see the note at the end of retro_audio.cpp.");
-#endif
 }
 
 void Shutdown() {
-#if defined(EDEN_LIBRETRO_SINK_HOOK)
     AudioCore::Sink::SetSinkOverride(nullptr);
-#endif
     g_staging.clear();
     g_staging.shrink_to_fit();
     g_accumulator.clear();
@@ -603,44 +605,43 @@ void Pump(retro_audio_sample_batch_t cb) {
 } // namespace LibretroCore::Audio
 
 // ============================================================================
-// WHAT THIS FILE STILL NEEDS FROM ELSEWHERE (not owned by this lane)
+// WHAT IS WIRED, AND WHAT IS STILL OWED FROM ELSEWHERE
 //
-// 1. src/audio_core/sink/sink_details.h - declare the hook:
+// DONE, in this change:
+//   * src/audio_core/sink/sink_details.cpp - SetSinkOverride is defined there under
+//     ENABLE_LIBRETRO, CreateSinkFromID consults it before GetOutputSinkDetails, and
+//     GetDeviceListForSink short-circuits so no backend is enumerated once the frontend
+//     owns the device.
+//   * src/audio_core/CMakeLists.txt - turns the ENABLE_LIBRETRO *option* into a compile
+//     definition for audio_core's own sources (PRIVATE). It was only ever an option
+//     before, so sink_details.cpp could not have tested it.
+//   * this file - the guard is gone. libretro_core is only added to the build under
+//     ENABLE_LIBRETRO (src/CMakeLists.txt:275-277), so a second macro would have had no
+//     configuration in which it could differ from it.
+//
+// STILL OWED, neither of which blocks audio working:
+//
+// 1. src/audio_core/sink/sink_details.h is where this pair belongs:
 //
 //        using SinkFactoryFn = std::unique_ptr<Sink> (*)(std::string_view);
 //        /// Install a frontend-supplied sink factory, overriding sink_id. nullptr clears.
 //        void SetSinkOverride(SinkFactoryFn factory);
 //
-// 2. src/audio_core/sink/sink_details.cpp - define it, and check it FIRST in
-//    CreateSinkFromID, before GetOutputSinkDetails runs (for AudioEngine::Auto that
-//    function calls GetCubebLatency, which opens a real cubeb context):
+//    Today the declaration is written out by hand in two places - near the top of this
+//    file, and above the anonymous namespace in sink_details.cpp (it must be outside it;
+//    the SinkDetails machinery is inside one) - because -Werror=missing-declarations
+//    wants a declaration before the definition. Both spell the same function type, so
+//    adding the header version is a redeclaration and needs no edit to either .cpp.
 //
-//        namespace { SinkFactoryFn g_sink_override{nullptr}; }
-//        void SetSinkOverride(SinkFactoryFn factory) { g_sink_override = factory; }
-//
-//        std::unique_ptr<Sink> CreateSinkFromID(Settings::AudioEngine sink_id,
-//                                               std::string_view device_id) {
-//            if (g_sink_override != nullptr) {
-//                return g_sink_override(device_id);
-//            }
-//            return GetOutputSinkDetails(sink_id).factory(device_id);
-//        }
-//
-//    Note SetSinkOverride must be declared outside the file's anonymous namespace; the
-//    existing SinkDetails machinery is inside one.
-//
-// 3. src/libretro_core/CMakeLists.txt - define the macro and link audio_core
-//    explicitly. The link is very likely already satisfied transitively (eden_libretro
-//    links `core` PUBLIC, and src/core/CMakeLists.txt:1203 links audio_core PRIVATE,
-//    which reaches consumers as LINK_ONLY), but relying on another target's private
-//    dependency for symbols this file now references is not a thing to leave implicit:
+// 2. src/libretro_core/CMakeLists.txt could name the dependency it now has:
 //
 //        target_link_libraries(eden_libretro PRIVATE audio_core)
-//        target_compile_definitions(eden_libretro PRIVATE EDEN_LIBRETRO_SINK_HOOK)
 //
 //    and the comment at CMakeLists.txt:42-44 ("audio_core would be needed only once a
-//    real libretro sink exists") stops being true.
-//
-// All three land together. With none of them this file builds and emits silence, as
-// before; with all three it emits the emulator's audio. There is no half state.
+//    real libretro sink exists") is no longer true. This is tidiness, not a fix: the
+//    symbols already resolve, because eden_libretro links `core` PUBLIC and
+//    src/core/CMakeLists.txt links audio_core PRIVATE, which reaches consumers as
+//    LINK_ONLY and so lands after eden_libretro in the final static link line. That
+//    already had to be true before this change - LibretroSinkStream's vtable references
+//    SinkStream::AppendBuffer and ReleaseBuffer, both defined in sink_stream.cpp.
 // ============================================================================
