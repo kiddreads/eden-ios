@@ -1,6 +1,6 @@
 --- a/include/oaknut/code_block.hpp
 +++ b/include/oaknut/code_block.hpp
-@@ -30,22 +30,41 @@
+@@ -30,22 +30,59 @@
      {
  #if defined(_WIN32)
          m_memory = (std::uint32_t*)VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
@@ -22,22 +22,40 @@
              throw std::bad_alloc{};
 +#else
 +        // mmap reports failure as MAP_FAILED ((void*)-1), never as nullptr, so the
-+        // `== nullptr` check below every branch never fired: a failed mapping was kept as a
-+        // valid pointer and the first write to it faulted somewhere unrelated. On iOS a
-+        // failed mapping is the NORMAL outcome when the process has not been granted the
-+        // right to hold executable memory, so the common case produced an unattributable
-+        // crash instead of a catchable error.
++        // `== nullptr` check below every branch never fired: a failed mapping was kept
++        // as a valid pointer and the first write to it faulted somewhere unrelated. On
++        // iOS a failed mapping is the NORMAL outcome when the process has not been
++        // granted the right to hold executable memory, so the common case produced an
++        // unattributable crash instead of a catchable error.
 +        //
-+        // Note on iOS and MAP_JIT: the mapping and toggling shape below is deliberately
-+        // left exactly as upstream had it. MAP_JIT pairs with
-+        // pthread_jit_write_protect_np(), and that function is not merely restricted on
-+        // iOS - it is absent from the SDK, declared __attribute__((unavailable)), so even
-+        // naming it fails to compile. The mprotect toggle is the only mechanism available
-+        // there.
++        // iOS NOTE (2026-09-12, revised after real device data). The previous version
++        // of this file mapped PROT_READ | PROT_EXEC only, with no PROT_WRITE, and
++        // relied on protect()/unprotect() to mprotect the WRITE bit in and out later.
++        // A device log (eden-ios's own JIT probe, and independently MeloNX's
++        // DualMappedJitAllocator on an A12Z) shows that does not work: mmap/mprotect's
++        // max_protection ceiling is fixed at the INITIAL mmap() call on Darwin, and a
++        // later mprotect() asking for a bit that was never in that ceiling does not
++        // fail loudly - it returns 0 and silently intersects the request with
++        // max_protection, so "mprotect(PROT_READ|PROT_EXEC)" on a page mapped
++        // PROT_READ|PROT_EXEC-only-then-toggled-to-RW leaves the page with less than
++        // was asked for, and executing it raises SIGBUS. The probe's own strategy 0
++        // (mmap RW, mprotect to RX) and strategy 1 (mmap RX, mprotect to RW, back to
++        // RX - this file's actual iOS shape before this patch) both failed exactly
++        // that way, with an observed max_prot of 0x3 (no execute bit ever available).
++        //
++        // The fix is what MeloNX independently found and confirmed executing real
++        // JIT-compiled code with, on the same device class: request every bit the
++        // mapping will ever need - PROT_READ | PROT_WRITE | PROT_EXEC - in the ONE
++        // initial mmap() call, with no MAP_JIT (MAP_JIT itself is refused outright,
++        // errno 22, without the dynamic-codesigning/allow-jit entitlements this build
++        // does not carry - confirmed by both cemu-ios-muffin and this project's own
++        // probe). Once RWX is the ceiling, protect()/unprotect() toggling within it
++        // (RX <-> RW) is ordinary, well within max_protection, and does not hit this
++        // failure mode.
 +        void* mem = MAP_FAILED;
 +#    if defined(__APPLE__)
 +#        if TARGET_OS_IPHONE
-+        mem = mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
++        mem = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
 +#        else
 +        mem = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
 +#        endif
