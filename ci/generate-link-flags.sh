@@ -15,7 +15,10 @@
 # linker can find it too."
 #
 # Eden's tree has the same shape: src/*/lib*.a from the project's own targets, plus
-# everything CPM fetched and built under <build>/_deps. One find covers both.
+# everything CPM fetched and built under <build>/_deps - and, for CPM's "ci"/prebuilt
+# packages (FFmpeg's bundled path among them), archives that were only ever downloaded
+# into .cache/cpm under the SOURCE tree and never touch <build> at all. Two finds cover
+# all three; see the CPM_CACHE_DIR block below for why the second one exists.
 #
 # ===========================================================================
 # WHAT THIS SCRIPT DELIBERATELY DOES NOT DO
@@ -76,6 +79,46 @@ ARCHIVES="$(find "$BUILD_DIR" -name '*.a' -not -path '*/debug/*' | sort -u)"
 if [ -z "$ARCHIVES" ]; then
     echo "generate-link-flags.sh: FATAL - no .a files under $BUILD_DIR" >&2
     exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# CPM's prebuilt/CI packages, e.g. FFmpeg.
+#
+# CMakeLists.txt:13 sets CPM_SOURCE_CACHE to ${CMAKE_SOURCE_DIR}/.cache/cpm - a path
+# under the SOURCE tree, not under whatever CMAKE_BINARY_DIR happened to be. CPMUtil's
+# AddPackage() (CMakeModules/CPMUtil.cmake) downloads/extracts every bundled package
+# into get_cache_path(), i.e. "$CPM_SOURCE_CACHE/<name>/<version-key>/", and for a "ci"
+# package (cpmfile.json's "ci": true, e.g. the "ffmpeg-ci" entry AddJsonPackage(ffmpeg)
+# resolves to under YUZU_USE_BUNDLED_FFMPEG - externals/ffmpeg/CMakeLists.txt:181-203)
+# that IS the package: a prebuilt archive, never compiled into $BUILD_DIR at all. The
+# FFmpeg::FFmpeg imported target's .a files physically live here, so the $BUILD_DIR
+# scan above never sees them and every FFmpeg symbol video_core references
+# (_av_strerror, _avcodec_open2, _av_frame_alloc, _av_hwdevice_ctx_create, ...) comes up
+# undefined at the app's link - the CMake-level target_link_libraries(video_core
+# PRIVATE ${FFmpeg_LIBRARIES}) at src/video_core/CMakeLists.txt:420 is real, but this
+# script - not CMake - is what puts archives on the actual Xcode link line.
+#
+# This is not FFmpeg-specific: any "ci"-flagged cpmfile.json package (present or
+# future) lands the same way, so the fix is to scan the whole cache, not one name.
+#
+# Not the OpenSSL trap (CMakeLists.txt:392-399, "libcrypto.a comes out built for
+# macOS"): that was openssl-cmake building OpenSSL FROM SOURCE via its own Configure
+# script, which auto-detects the HOST platform and picked darwin64-arm64-cc under
+# cross-compilation. AddCIPackage (CMakeModules/CPMUtil.cmake:1023-1046) instead names
+# the artifact it requests after the TARGET: "ios-aarch64" whenever IOS and
+# CPMUTIL_ARM64 are both set, so the file ffmpeg-ci downloads is asked for by iOS/arm64
+# name, not assumed from the host. Whether crueter-ci/FFmpeg's release actually
+# published that artifact was NOT checked here - no network access in this lane - but
+# the download mechanism itself is not the OpenSSL failure mode.
+CPM_CACHE_DIR="${EDEN_CPM_CACHE_DIR:-$REPO_ROOT/.cache/cpm}"
+if [ -d "$CPM_CACHE_DIR" ]; then
+    echo "generate-link-flags.sh: scanning $CPM_CACHE_DIR (CPM prebuilt packages)"
+    CPM_ARCHIVES="$(find "$CPM_CACHE_DIR" -name '*.a' -not -path '*/debug/*' | sort -u)"
+    if [ -n "$CPM_ARCHIVES" ]; then
+        ARCHIVES="$(printf '%s\n%s\n' "$ARCHIVES" "$CPM_ARCHIVES" | sort -u)"
+    fi
+else
+    echo "generate-link-flags.sh: note - no CPM cache at $CPM_CACHE_DIR (nothing bundled/prebuilt, or not yet configured)"
 fi
 
 printf '%s\n' "$ARCHIVES" >> "$OUT"

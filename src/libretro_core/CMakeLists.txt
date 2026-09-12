@@ -30,6 +30,14 @@ add_library(eden_libretro STATIC
     vma_impl.cpp
 )
 
+# VulkanMemoryAllocator's implementation does not compile clean under Eden's -Werror
+# set - vk_mem_alloc.h has unused variables of its own. That is vendored third-party
+# code: the warnings are not ours to fix, and -Werror on someone else's header only
+# means we cannot use the library at all. Scoped to this one translation unit, so the
+# project's own sources keep every warning they had.
+set_source_files_properties(vma_impl.cpp PROPERTIES COMPILE_OPTIONS
+    "-Wno-unused-variable;-Wno-unused-parameter;-Wno-missing-field-initializers;-Wno-nullability-completeness;-Wno-unused-function")
+
 create_target_directory_groups(eden_libretro)
 
 # The app links this target and includes "eden_libretro.h" and "libretro.h".
