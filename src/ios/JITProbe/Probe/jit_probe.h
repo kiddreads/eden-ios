@@ -114,7 +114,12 @@ typedef enum {
     JP_OUTCOME_PASS
 } jp_outcome;
 
-#define JP_STRATEGY_COUNT 4
+// A 5th strategy was added 2026-09-12 after a real device (iPad8,11, iOS 26.6.1)
+// showed strategies 0 and 1 both fail with SIGBUS: mprotect() silently intersects
+// a requested protection with the ceiling max_protection set at the ORIGINAL
+// mmap() call rather than failing, so asking for PROT_EXEC later than the first
+// mmap never actually grants it. Strategy 4 requests every bit at once.
+#define JP_STRATEGY_COUNT 5
 
 typedef struct {
     int         index;
