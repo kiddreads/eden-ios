@@ -220,50 +220,61 @@ struct ProbeView: View {
 
     // MARK: plain English
 
+    // The three explanation strings used to be built INSIDE the ViewBuilder via an
+    // if/else-if/else with multiline literals - that combination (heavy string
+    // literals plus branching, all inside view-builder type inference) is exactly
+    // what made Swift give up with "unable to type-check this expression in
+    // reasonable time". Precomputing plain Strings outside any ViewBuilder context
+    // removes the string/branch assembly from the inference problem entirely; the
+    // view body is then just one Text(constant) per branch, chosen by a switch.
+    private var meaningText: String {
+        if !model.finished {
+            return """
+                   This app writes four machine instructions into memory and tries to \
+                   run them. Nothing else. It is checking the one thing Eden cannot \
+                   work without.
+
+                   If the app closes by itself, that is a result, not a crash — it \
+                   means iOS refused. Just open it again and it will carry on from \
+                   where it stopped. You may have to do that up to four times.
+                   """
+        } else if model.passed {
+            return """
+                   The app wrote instructions into memory and ran them, and they \
+                   returned the right answers. That is the permission Eden's \
+                   recompiler needs.
+
+                   This result is about THIS device with THIS app installed THIS way. \
+                   Installing differently — or, if a JIT enabler was used, not using \
+                   it next time — can change it.
+                   """
+        } else {
+            return """
+                   Every way of getting runnable memory was refused or killed the app.
+
+                   Eden has no fallback for this. It has no interpreter, so this is \
+                   not "Eden would be slow here" — it is that Eden cannot emulate on \
+                   this device, installed this way, at all.
+
+                   If you have a JIT enabler such as StikDebug or a TrollStore \
+                   install, launching through it and running this again is the next \
+                   thing to try.
+                   """
+        }
+    }
+
+    private var debuggerLabelText: String {
+        "A debugger is attached (CS_DEBUGGED is set), so this result is for the debugger-attached case."
+    }
+
     private var meaning: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("What this is")
                 .font(.headline)
-            if !model.finished {
-                Text("""
-                     This app writes four machine instructions into memory and tries to \
-                     run them. Nothing else. It is checking the one thing Eden cannot \
-                     work without.
-
-                     If the app closes by itself, that is a result, not a crash — it \
-                     means iOS refused. Just open it again and it will carry on from \
-                     where it stopped. You may have to do that up to four times.
-                     """)
-                    .font(.callout)
-            } else if model.passed {
-                Text("""
-                     The app wrote instructions into memory and ran them, and they \
-                     returned the right answers. That is the permission Eden's \
-                     recompiler needs.
-
-                     This result is about THIS device with THIS app installed THIS way. \
-                     Installing differently — or, if a JIT enabler was used, not using \
-                     it next time — can change it.
-                     """)
-                    .font(.callout)
-            } else {
-                Text("""
-                     Every way of getting runnable memory was refused or killed the app.
-
-                     Eden has no fallback for this. It has no interpreter, so this is \
-                     not "Eden would be slow here" — it is that Eden cannot emulate on \
-                     this device, installed this way, at all.
-
-                     If you have a JIT enabler such as StikDebug or a TrollStore \
-                     install, launching through it and running this again is the next \
-                     thing to try.
-                     """)
-                    .font(.callout)
-            }
+            Text(meaningText)
+                .font(.callout)
             if model.debuggerPresent {
-                Label("A debugger is attached (CS_DEBUGGED is set), so this result is "
-                      + "for the debugger-attached case.",
-                      systemImage: "ladybug")
+                Label(debuggerLabelText, systemImage: "ladybug")
                     .font(.footnote)
                     .foregroundColor(.secondary)
             }
