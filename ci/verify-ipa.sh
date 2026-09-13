@@ -156,7 +156,7 @@ fi
 # that did. ci/generate-link-flags.sh force-loads libeden_libretro.a; this is what
 # checks the force-load actually worked.
 MISSING_SYMS=""
-for sym in _retro_init _retro_run _retro_load_game _eden_libretro_set_metal_layer; do
+for sym in _retro_init _retro_run _retro_load_game _eden_libretro_set_metal_layer _eden_libretro_resize _eden_libretro_set_visible _eden_libretro_set_data_root; do
     # -g --defined-only: global symbols that this binary defines. Darwin's nm has
     # historically read -U as "undefined only" and llvm-nm reads it as --defined-only,
     # so the long form is spelled out rather than relying on which nm is on PATH.
