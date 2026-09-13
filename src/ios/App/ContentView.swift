@@ -41,18 +41,39 @@ struct ContentView: View {
             EmulationView()
                 .environmentObject(session)
         }
-        .sheet(isPresented: $showSetupGuide) {
-            SetupGuideView()
-        }
-        .sheet(item: $session.jitRefusal) { status in
-            JITRequiredView(status: status)
-                .environmentObject(jit)
-        }
-        .sheet(item: $importKind) { kind in
-            DocumentPicker(contentTypes: kind.contentTypes, allowsMultiple: kind.allowsMultiple) { urls in
-                handleImport(kind: kind, urls: urls)
+        // Three .sheet(...) modifiers used to be chained directly on this same
+        // NavigationView, alongside the .fullScreenCover above. That is a well-known
+        // SwiftUI failure mode: multiple presentation modifiers stacked on ONE view
+        // compete for a single presentation slot, and typically only one of them
+        // ever actually appears - the others' state flips (importKind genuinely
+        // becomes non-nil, handleImport genuinely would have run) with nothing ever
+        // shown on screen. That is indistinguishable from "the button does nothing",
+        // which is exactly what every import button looked like, because all three
+        // of ROM/keys/firmware import route through the SAME $importKind sheet, and
+        // that sheet was competing with showSetupGuide's and jitRefusal's.
+        //
+        // Fixed by giving each its own attachment point: a distinct, invisible
+        // Color.clear child view per sheet, rather than four modifiers on one node.
+        // Each .background() call creates a genuinely separate view instance, so
+        // SwiftUI no longer has to arbitrate between modifiers on the same view.
+        .background(
+            Color.clear.sheet(isPresented: $showSetupGuide) {
+                SetupGuideView()
             }
-        }
+        )
+        .background(
+            Color.clear.sheet(item: $session.jitRefusal) { status in
+                JITRequiredView(status: status)
+                    .environmentObject(jit)
+            }
+        )
+        .background(
+            Color.clear.sheet(item: $importKind) { kind in
+                DocumentPicker(contentTypes: kind.contentTypes, allowsMultiple: kind.allowsMultiple) { urls in
+                    handleImport(kind: kind, urls: urls)
+                }
+            }
+        )
         .alert("Import", isPresented: Binding(
             get: { importReport != nil },
             set: { if !$0 { importReport = nil } }
