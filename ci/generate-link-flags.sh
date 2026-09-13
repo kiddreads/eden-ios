@@ -211,7 +211,7 @@ echo "-Wl,-force_load,$EDEN_LIBRETRO" >> "$OUT"
 # whole-program dead-stripping regardless of what static reachability analysis
 # concludes - exactly the libretro-core-baked-into-one-executable shape this port
 # exists to make work on iOS, where there is no separate dylib to export from.
-for sym in _retro_init _retro_run _retro_load_game _eden_libretro_set_metal_layer; do
+for sym in _retro_init _retro_run _retro_load_game _eden_libretro_set_metal_layer _eden_libretro_resize _eden_libretro_set_visible _eden_libretro_set_data_root; do
     echo "-Wl,-exported_symbol,$sym" >> "$OUT"
 done
 
