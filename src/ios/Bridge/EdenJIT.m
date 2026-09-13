@@ -169,20 +169,53 @@ static void EdenProbeMapJIT(EdenJITReport *r) {
 }
 
 static void EdenProbeMprotect(EdenJITReport *r) {
-    // THE PATH THAT MATTERS. This mirrors oaknut::CodeBlock as patched for this port:
-    // plain anonymous memory, mapped PROT_READ|PROT_EXEC at map time (not RW then
-    // promoted), then toggled RW and back with mprotect.
+    // THE PATH THAT MATTERS. Updated 2026-09-13 to match oaknut::CodeBlock as it
+    // actually is now, not as it used to be: a real A12Z device log showed the OLD
+    // shape (mmap PROT_READ|PROT_EXEC, then mprotect RW/RX to toggle) failing -
+    // mprotect returned success while the page silently could not execute, because
+    // Darwin fixes a mapping's max_protection at the ORIGINAL mmap() call and a later
+    // mprotect() asking for a bit outside that ceiling is granted only up to the
+    // intersection, not refused outright. .patch/oaknut/0001-ios-jit-modes.patch fixed
+    // it by requesting every bit - PROT_READ|PROT_WRITE|PROT_EXEC - in the one mmap()
+    // call. This probe mirrored the OLD shape and was therefore checking the wrong
+    // syscalls: a pass here no longer meant oaknut's actual runtime path would work.
+    //
+    // Also widened from one transition to the shape oaknut genuinely repeats for the
+    // life of the code cache - unprotect() [mprotect RW] before writing more code,
+    // protect() [mprotect RX] before running it, over and over - since a single
+    // down-transition passing does not by itself prove a SECOND one will.
     const size_t page = (size_t)getpagesize();
 
     errno = 0;
-    void *p = mmap(NULL, page, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
+    void *p = mmap(NULL, page, PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED) {
         r->mprotect_rx_succeeded = false;
         r->mprotect_errno = errno;
         return;
     }
 
-    // unprotect(): make it writable so code can be emitted.
+    // The mapping starts fully RWX - both its current and maximum protection - so
+    // writing here needs no unprotect() first. Not executed; this is the state
+    // between protect()/unprotect() calls, not a claim about what runs.
+    *(volatile unsigned char *)p = 0x1F;   // low byte of arm64 NOP; never executed
+
+    // protect(): down to RX. THIS is the call a process without dynamic-codesigning
+    // or CS_DEBUGGED is refused - removing a bit already granted at mmap time, never
+    // adding one that was not there.
+    errno = 0;
+    if (mprotect(p, page, PROT_READ | PROT_EXEC) != 0) {
+        r->mprotect_rx_succeeded = false;
+        r->mprotect_errno = errno;
+        munmap(p, page);
+        return;
+    }
+
+    // unprotect() again: oaknut calls this every time more code needs to be emitted
+    // into an already-established cache, not just once at creation. If only the
+    // FIRST down-transition were tested, a device that only permits it once (and
+    // silently defeats a second toggle) would look identical to one that supports
+    // the full JIT lifecycle - so this is tested rather than assumed.
     errno = 0;
     if (mprotect(p, page, PROT_READ | PROT_WRITE) != 0) {
         r->mprotect_rx_succeeded = false;
@@ -191,12 +224,9 @@ static void EdenProbeMprotect(EdenJITReport *r) {
         return;
     }
 
-    // Write a byte. Writing is not executing, and this is the operation that would
-    // fault on a W^X-enforced page.
-    *(volatile unsigned char *)p = 0x1F;   // low byte of arm64 NOP; never executed
+    *(volatile unsigned char *)p = 0x1F;
 
-    // protect(): back to executable. THIS is the call that a process without
-    // dynamic-codesigning or CS_DEBUGGED is refused.
+    // protect() a second time: the state oaknut actually leaves code in before a jump.
     errno = 0;
     if (mprotect(p, page, PROT_READ | PROT_EXEC) != 0) {
         r->mprotect_rx_succeeded = false;
@@ -276,7 +306,7 @@ static void EdenFormatDiagnostics(const EdenJITReport *r) {
              "  [informational only - oaknut cannot use MAP_JIT on iOS,\n"
              "   pthread_jit_write_protect_np is unavailable in the SDK]\n"
              "\n"
-             "anon RX + mprotect RW/RX: %s (errno %d)\n"
+             "anon RWX, mprotect RX/RW/RX: %s (errno %d)\n"
              "  [THIS is the mechanism Eden's oaknut actually uses]\n"
              "\n"
              "Nothing was executed. A syscall succeeding is not proof that running\n"
