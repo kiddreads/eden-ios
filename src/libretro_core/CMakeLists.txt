@@ -44,16 +44,31 @@ create_target_directory_groups(eden_libretro)
 target_include_directories(eden_libretro PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 
 # core is PUBLIC because eden_libretro.h's siblings expose Core::System types.
-# frontend_common and audio_core are deliberately NOT linked:
-#   * frontend_common would be needed for ContentManager::AreKeysPresent and
-#     FirmwareManager, but firmware_manager.h includes
-#     core/hle/service/am/frontend/applet_mii_edit.h and I have not verified what that
-#     drags in. retro_content.cpp calls Core::Crypto::KeyManager directly instead.
-#   * audio_core would be needed only once a real libretro sink exists; the current
-#     audio path emits silence and touches nothing in audio_core.
+#
+# frontend_common IS now linked (2026-09-13; it was not before). The reason it was
+# excluded no longer applies: the concern was about OUR OWN SOURCE including
+# firmware_manager.h, whose applet_mii_edit.h drag-in was unverified - retro_content.cpp
+# never does that, it calls Core::Crypto::KeyManager directly, so nothing here ever
+# touches frontend_common's headers. Linking the already-built archive is a different
+# question, and the real app link needs it regardless of any header question:
+# src/core/hle/service/ns/query_service.cpp calls PlayTime::PlayTimeManager, which lives
+# in frontend_common (play_time_manager.cpp), and core.a does not embed it - two
+# separate static archives, so the symbol is only resolved if something downstream of
+# core links frontend_common too. Verified play_time_manager.h pulls in nothing beyond
+# common/ headers, and frontend_common's only unconditional dependencies (core, common,
+# and the header-only SimpleIni/frozen interface libraries) are already satisfied here -
+# ENABLE_UPDATE_CHECKER is OFF in this build, so its httplib/nlohmann_json/OpenSSL
+# dependencies never enter the picture.
+#
+# audio_core is still not linked directly. A previous pass wired a real libretro audio
+# sink into it under ENABLE_LIBRETRO, but its symbols were already reported to resolve
+# transitively - eden_libretro links core PUBLIC, and src/core/CMakeLists.txt links
+# audio_core PRIVATE, which reaches this target as LINK_ONLY and lands after
+# eden_libretro in the static link line. Add it directly here only if a build ever shows
+# an audio_core symbol undefined.
 target_link_libraries(eden_libretro
     PUBLIC core
-    PRIVATE common input_common hid_core video_core network)
+    PRIVATE common input_common hid_core video_core network frontend_common)
 
 target_link_libraries(eden_libretro PRIVATE ${PLATFORM_LIBRARIES})
 
