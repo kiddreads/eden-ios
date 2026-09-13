@@ -195,6 +195,26 @@ done
 EDEN_LIBRETRO="$(printf '%s\n' "$ARCHIVES" | grep '/libeden_libretro\.a$' | head -1)"
 echo "-Wl,-force_load,$EDEN_LIBRETRO" >> "$OUT"
 
+# force_load only controls which OBJECT FILES the linker considers - it does not
+# stop -dead_strip (on by default for a Release/Archive iOS build) from later
+# removing individual FUNCTIONS it judges unreachable, even inside a file it was
+# forced to include. verify-ipa.sh's first run of this build proved that is exactly
+# what happened: EdenCoreBridge.m calls retro_init()/retro_load_game()/retro_run()
+# as ordinary direct C calls (confirmed by reading the source, not assumed), so the
+# link succeeding at all already proves those calls resolved and retro_core.o was
+# pulled in - "Build the app" would have failed with undefined symbols otherwise.
+# The four symbols still went missing from the PACKAGED binary nm -g checks
+# against, which is the signature of dead-code elimination running as a later,
+# separate pass over already-linked code, not a resolution failure.
+#
+# -exported_symbol is the standard fix for a C ABI entry point that must survive
+# whole-program dead-stripping regardless of what static reachability analysis
+# concludes - exactly the libretro-core-baked-into-one-executable shape this port
+# exists to make work on iOS, where there is no separate dylib to export from.
+for sym in _retro_init _retro_run _retro_load_game _eden_libretro_set_metal_layer; do
+    echo "-Wl,-exported_symbol,$sym" >> "$OUT"
+done
+
 # ---------------------------------------------------------------------------
 # System libraries.
 #
