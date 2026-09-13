@@ -72,7 +72,7 @@ The packaging step produces **four** IPAs, not three: `unsigned`, plus ad-hoc re
 | M0 | Eden's source mirrored into this repo, CI in place | **met** | repo + workflows |
 | M1 | Eden's core libraries cross-compile for `iphoneos` arm64 | **met** | CI: 10 targets, Arm64 symbols in `libdynarmic.a` |
 | M2 | A libretro core links for iOS | **met** | CI: `eden_libretro` builds for iphoneos arm64 |
-| M3 | An installable artifact launches on a real device | **not met** | app + IPA pipeline written; no successful link, no IPA, no device |
+| M3 | An installable artifact launches on a real device | **half met** | app links, 17/17 verify-ipa.sh checks pass, IPAs published (`app-v1`) — not yet confirmed launching on a device |
 | M4 | A homebrew `.nro` boots and something it draws reaches the screen | not started | — |
 | M5 | A retail title boots | not started | — |
 | M6 | Input, audio, and a stable frame pace | not started | — |
