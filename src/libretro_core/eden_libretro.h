@@ -12,6 +12,23 @@
 
 #include <stdbool.h>
 
+// eden_libretro is built with CXX_VISIBILITY_PRESET hidden (src/libretro_core/
+// CMakeLists.txt) so everything the archive does not explicitly need to hand to the
+// app stays out of the symbol table. libretro.h's own entry points (retro_init and
+// friends) get default visibility from its RETRO_API macro; these four did not have
+// an equivalent and so compiled as private_extern - which -exported_symbol in
+// ci/generate-link-flags.sh cannot resurrect, because that flag only decides which
+// already-GLOBAL symbols survive -dead_strip, it does not promote a symbol the
+// compiler already emitted as hidden. A real build showed this precisely:
+// _retro_init/_retro_run/_retro_load_game (RETRO_API, default visibility) survived
+// -exported_symbol; _eden_libretro_set_metal_layer (no visibility attribute here)
+// did not, and was stripped from the packaged binary despite linking successfully.
+#if defined(__GNUC__) || defined(__clang__)
+#define EDEN_LIBRETRO_API __attribute__((visibility("default")))
+#else
+#define EDEN_LIBRETRO_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -32,7 +49,7 @@ extern "C" {
  *
  * Call before retro_load_game. The layer must outlive Core::System.
  */
-void eden_libretro_set_metal_layer(void* metal_layer, unsigned width, unsigned height);
+EDEN_LIBRETRO_API void eden_libretro_set_metal_layer(void* metal_layer, unsigned width, unsigned height);
 
 /**
  * Call from layoutSubviews / rotation with the new PHYSICAL pixel size.
@@ -40,14 +57,14 @@ void eden_libretro_set_metal_layer(void* metal_layer, unsigned width, unsigned h
  * thread calls vkAcquireNextImageKHR, and the layer's geometry must not be mutated
  * concurrently from elsewhere.
  */
-void eden_libretro_resize(unsigned width, unsigned height);
+EDEN_LIBRETRO_API void eden_libretro_resize(unsigned width, unsigned height);
 
 /**
  * Call from applicationDidEnterBackground / applicationWillEnterForeground.
  * RendererVulkan::Composite early-returns when the window reports not-shown, which
  * is how presentation stops against a layer iOS has taken away.
  */
-void eden_libretro_set_visible(bool visible);
+EDEN_LIBRETRO_API void eden_libretro_set_visible(bool visible);
 
 /**
  * Point Eden's data tree (keys, NAND, sdmc, shader cache, logs) at a writable
@@ -63,7 +80,7 @@ void eden_libretro_set_visible(bool visible);
  * Call before retro_load_game. If it is never called, the core falls back to
  * RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, and failing that to Eden's own default.
  */
-void eden_libretro_set_data_root(const char* path);
+EDEN_LIBRETRO_API void eden_libretro_set_data_root(const char* path);
 
 #ifdef __cplusplus
 }
